@@ -5,41 +5,51 @@ def get_architect_plan(user_query, api_key):
     # 1. Connect and Auto-Detect Model
     genai.configure(api_key=api_key)
     
-    # SYSTEM: Find a model that actually exists for this user
-    active_model = "models/gemini-1.5-flash" # Default fallback
+    # Auto-find the best available model
+    active_model = "gemini-pro"
     try:
-        # List all models available to your specific API Key
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
-                # Prefer a Flash model if available (faster)
                 if 'flash' in m.name:
                     active_model = m.name
                     break
-                # Otherwise keep the first valid one found
                 active_model = m.name
-    except Exception as e:
-        return {"error": f"API Key Error: {str(e)}", "steps": []}
+    except:
+        pass
 
-    # 2. Configure the Brain with the found model
     model = genai.GenerativeModel(active_model)
 
-    # 3. The Planner Prompt
+    # 2. THE UNIVERSAL PROMPT (The "All-Rounder" Logic)
     system_instructions = """
-    ROLE: Chief Architect of Samketan AI.
-    TASK: Break down this complex user query into a JSON execution plan.
-    FORMAT: JSON only.
+    ROLE: Chief Strategist of Samketan AI.
     
-    OUTPUT STRUCTURE:
+    YOUR CAPABILITY:
+    You are not just a researcher. You adapt to the DOMAIN of the user's request:
+    
+    1. IF "POLITICS/TRENDS":
+       - Strategy: Focus on "Real-time" keywords. Search for 'Twitter trends', 'Latest news', 'Viral hashtags'.
+       - Action: Look for 'Who is trending', 'Public sentiment', 'Controversies'.
+       
+    2. IF "BUSINESS/SURVEY":
+       - Strategy: Focus on "Data" and "Competitors".
+       - Action: Plan a survey structure or find market gaps.
+       
+    3. IF "JOBS/CAREER":
+       - Strategy: Focus on "Skills" and "Openings".
+       - Action: Search specific job portals (Naukri, LinkedIn) and skill requirements.
+
+    OUTPUT FORMAT (Strict JSON):
     {
-        "thought_process": "Reasoning...",
+        "thought_process": "Identify the domain (Politics/Business/etc) and explain the strategy...",
         "steps": [
-            {"step": 1, "action": "search", "query": "search term"},
-            {"step": 2, "action": "analyze", "target": "specific data"}
+            {"step": 1, "action": "search", "query": "Specific search query"},
+            {"step": 2, "action": "search", "query": "Another angle to search"},
+            {"step": 3, "action": "analyze", "target": "What to conclude from the data"}
         ]
     }
     """
 
-    # 4. Execute
+    # 3. Execute
     try:
         response = model.generate_content(
             f"{system_instructions}\n\nUSER QUERY: {user_query}",
@@ -47,4 +57,4 @@ def get_architect_plan(user_query, api_key):
         )
         return json.loads(response.text)
     except Exception as e:
-        return {"error": f"Model {active_model} failed: {str(e)}", "thought_process": "Error", "steps": []}
+        return {"error": str(e), "thought_process": "Planning Failed", "steps": []}
