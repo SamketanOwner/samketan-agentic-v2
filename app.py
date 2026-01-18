@@ -1,74 +1,103 @@
 import streamlit as st
 import time
+from pypdf import PdfReader
 from architect import get_architect_plan
 from hunter import execute_step
 
-st.set_page_config(page_title="Samketan V2: Full Autonomy", page_icon="🤖")
+st.set_page_config(page_title="Samketan V3: Document Intelligence", page_icon="📂")
 
-st.title("Samketan V2: Autonomous Agent")
-st.caption("Auto-Research System: Plan -> Search -> Result")
+st.title("Samketan V3: Commercial Agent")
+st.caption("Now with 'Document Eyes' + 'Web Search'")
 
-# CHECK FOR SECRET KEY FIRST
+# --- SIDEBAR: SETTINGS & TOOLS ---
+st.sidebar.header("⚙️ Control Panel")
+
+# 1. API Key Logic
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
-    st.sidebar.success("✅ API Key Loaded Securely")
+    st.sidebar.success("✅ API Key Loaded")
 else:
     api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
 
-# Session State to hold the plan in memory
+# 2. THE NEW FEATURE: Document Reader
+st.sidebar.markdown("---")
+st.sidebar.header("📂 Document Reader")
+uploaded_file = st.sidebar.file_uploader("Upload Tender/Invoice (PDF)", type="pdf")
+
+pdf_text = ""
+if uploaded_file is not None:
+    try:
+        reader = PdfReader(uploaded_file)
+        for page in reader.pages:
+            pdf_text += page.extract_text()
+        st.sidebar.success(f"✅ Read {len(reader.pages)} pages successfully!")
+    except Exception as e:
+        st.sidebar.error(f"Error reading PDF: {e}")
+
+# --- MAIN SCREEN ---
+
+# Session State
 if 'plan' not in st.session_state:
     st.session_state['plan'] = None
 
-user_query = st.text_area("Enter your Goal:", 
-                          "Find top 3 warehouse competitors in North Karnataka and their 2026 pricing.")
+# User Input
+base_query = st.text_area("Enter your Goal:", 
+                          "Analyze this tender document and tell me the qualification criteria.")
 
-# BUTTON 1: THE PLANNER
+# LOGIC: Combine User Goal + PDF Text (If available)
+final_query = base_query
+if pdf_text:
+    final_query = f"""
+    CONTEXT FROM UPLOADED DOCUMENT:
+    {pdf_text[:15000]} 
+    
+    USER GOAL: 
+    {base_query}
+    """
+    st.info(f"📎 Attached {len(pdf_text)} characters from your PDF to this query.")
+
+# BUTTON 1: GENERATE PLAN
 if st.button("1. Generate Plan"):
     if not api_key:
-        st.error("Need API Key!")
+        st.error("Please enter an API Key in the sidebar.")
     else:
-        with st.spinner("Architect is thinking..."):
-            plan = get_architect_plan(user_query, api_key)
+        with st.spinner("Architect is analyzing document & planning..."):
+            plan = get_architect_plan(final_query, api_key)
+            
             if "error" in plan:
                 st.error(plan['error'])
             else:
                 st.session_state['plan'] = plan
-                st.success("Plan Created! Review below.")
+                st.success("Plan Ready! Review below.")
 
-# Display Plan if it exists
+# DISPLAY PLAN & EXECUTE
 if st.session_state['plan']:
     plan = st.session_state['plan']
+    
     st.subheader("🧠 The Strategy")
     st.info(plan.get('thought_process'))
     
     st.subheader("📋 Execution Steps")
-    # Show steps in a clean list
     for step in plan.get('steps', []):
-        st.write(f"**Step {step['step']}:** {step.get('action')} -> *{step.get('query')}*")
+        st.write(f"**Step {step['step']}:** {step.get('action')} -> *{step.get('query') or step.get('target')}*")
 
     st.markdown("---")
     
-    # BUTTON 2: THE EXECUTOR
-    if st.button("2. Execute Mission (Launch The Hunter)"):
-        st.write("🚀 **Starting Autonomous Research...**")
+    # BUTTON 2: EXECUTE
+    if st.button("2. Execute Mission"):
+        st.write("🚀 **Starting Research...**")
         progress_bar = st.progress(0)
         
         all_steps = plan.get('steps', [])
         total_steps = len(all_steps)
         
-        # THE LOOP (Future Tech)
         for index, step in enumerate(all_steps):
             with st.chat_message("assistant"):
                 st.write(f"**Executing Step {step['step']}...**")
-                
-                # The Agent Acts
                 result = execute_step(step)
-                
-                # Show Result
                 st.code(result)
             
-            # Update Progress
             progress_bar.progress((index + 1) / total_steps)
-            time.sleep(1) # Tiny pause to be polite to the search engine
+            time.sleep(1)
             
-        st.success("Mission Complete. All data gathered.")
+        st.success("Mission Complete!")
