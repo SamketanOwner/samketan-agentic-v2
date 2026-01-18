@@ -129,4 +129,24 @@ if st.session_state['plan']:
             with st.chat_message("assistant"):
                 st.write(f"**Step {step['step']}: {action_type.upper()}**")
                 
-                # ---
+                # --- THE SMART SWITCH (STRICT MODE) ---
+                result = ""
+                
+                # CASE 1: SEARCH tasks MUST go to Hunter (Web)
+                if "search" in action_type:
+                    result = execute_step(step)
+                
+                # CASE 2: ANALYZE tasks with PDF go to Brain (Gemini)
+                elif pdf_context and ("analyze" in action_type or "summarize" in action_type or "extract" in action_type):
+                    result = ask_the_brain(query, pdf_context, api_key)
+                
+                # CASE 3: Fallback (If no PDF, but asked to analyze, default to search or generic brain)
+                else:
+                    result = execute_step(step)
+                
+                st.markdown(result)
+            
+            progress_bar.progress((i + 1) / len(steps))
+            time.sleep(1)
+            
+        st.success("Mission Complete!")
