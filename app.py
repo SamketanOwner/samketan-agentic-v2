@@ -7,7 +7,7 @@ from hunter import execute_step
 
 st.set_page_config(page_title="Samketan V3: Hybrid Agent", page_icon="🧠")
 
-st.title("Samketan V3: The Intelligent Analyst")
+st.title("Samketan V3: Universal Agent 🌍")
 st.caption("Auto-Switching: Web Search ↔️ Document Reading")
 
 # --- SIDEBAR: SETTINGS ---
