@@ -8,7 +8,12 @@ st.set_page_config(page_title="Samketan V2: Full Autonomy", page_icon="🤖")
 st.title("Samketan V2: Autonomous Agent")
 st.caption("Auto-Research System: Plan -> Search -> Result")
 
-api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
+# CHECK FOR SECRET KEY FIRST
+if "GEMINI_API_KEY" in st.secrets:
+    api_key = st.secrets["GEMINI_API_KEY"]
+    st.sidebar.success("✅ API Key Loaded Securely")
+else:
+    api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
 
 # Session State to hold the plan in memory
 if 'plan' not in st.session_state:
