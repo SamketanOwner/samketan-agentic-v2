@@ -2,30 +2,44 @@ import google.generativeai as genai
 import json
 
 def get_architect_plan(user_query, api_key):
-    # 1. Connect to the Brain
-    # We use 'gemini-pro' here as it is the most stable model
+    # 1. Connect and Auto-Detect Model
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-pro')
+    
+    # SYSTEM: Find a model that actually exists for this user
+    active_model = "models/gemini-1.5-flash" # Default fallback
+    try:
+        # List all models available to your specific API Key
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                # Prefer a Flash model if available (faster)
+                if 'flash' in m.name:
+                    active_model = m.name
+                    break
+                # Otherwise keep the first valid one found
+                active_model = m.name
+    except Exception as e:
+        return {"error": f"API Key Error: {str(e)}", "steps": []}
 
-    # 2. The System Prompt
+    # 2. Configure the Brain with the found model
+    model = genai.GenerativeModel(active_model)
+
+    # 3. The Planner Prompt
     system_instructions = """
-    ROLE: You are the Chief Architect of Samketan AI.
-    GOAL: You do NOT answer questions. You PLAN research.
+    ROLE: Chief Architect of Samketan AI.
+    TASK: Break down this complex user query into a JSON execution plan.
+    FORMAT: JSON only.
     
-    INSTRUCTIONS:
-    Analyze the user's request. If it is complex, break it down into steps.
-    
-    OUTPUT FORMAT (Strict JSON):
+    OUTPUT STRUCTURE:
     {
-        "thought_process": "Explain why you are breaking this down...",
+        "thought_process": "Reasoning...",
         "steps": [
-            {"step": 1, "action": "search", "query": "The exact search query for Google"},
-            {"step": 2, "action": "analyze", "target": "What to look for in the results"}
+            {"step": 1, "action": "search", "query": "search term"},
+            {"step": 2, "action": "analyze", "target": "specific data"}
         ]
     }
     """
 
-    # 3. Get the Plan
+    # 4. Execute
     try:
         response = model.generate_content(
             f"{system_instructions}\n\nUSER QUERY: {user_query}",
@@ -33,5 +47,4 @@ def get_architect_plan(user_query, api_key):
         )
         return json.loads(response.text)
     except Exception as e:
-        # If JSON fails, return a safe error structure
-        return {"error": str(e), "thought_process": "Planning Failed", "steps": []}
+        return {"error": f"Model {active_model} failed: {str(e)}", "thought_process": "Error", "steps": []}
