@@ -4,7 +4,7 @@ import json
 def get_architect_plan(user_query, api_key):
     # 1. Connect to the Brain (Gemini)
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+  model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
     # 2. The System Prompt (The "Thinker" instructions)
     system_instructions = """
