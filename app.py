@@ -5,7 +5,7 @@ from pypdf import PdfReader
 from architect import get_architect_plan
 from hunter import execute_step
 
-st.set_page_config(page_title="Samketan V3: Hybrid Agent", page_icon="🧠")
+st.set_page_config(page_title="Samketan V3: Universal Agent", page_icon="🌍")
 
 st.title("Samketan V3: Universal Agent 🌍")
 st.caption("Auto-Switching: Web Search ↔️ Document Reading")
@@ -20,7 +20,7 @@ else:
 # --- SIDEBAR: DOC READER ---
 st.sidebar.markdown("---")
 st.sidebar.header("📂 Document Intelligence")
-uploaded_file = st.sidebar.file_uploader("Upload PDF (Tender/Invoice/Report)", type="pdf")
+uploaded_file = st.sidebar.file_uploader("Upload PDF (CV/Tender/Report)", type="pdf")
 
 pdf_context = ""
 if uploaded_file is not None:
@@ -32,16 +32,43 @@ if uploaded_file is not None:
     except Exception as e:
         st.sidebar.error(f"Error reading PDF: {e}")
 
-# --- INTERNAL BRAIN FUNCTION ---
+# --- INTERNAL BRAIN FUNCTION (ROBUST) ---
 def ask_the_brain(task, context, key):
-    """Uses Gemini to analyze the PDF directly instead of searching Google."""
+    """Uses Gemini to analyze the PDF directly."""
     genai.configure(api_key=key)
-    # Smart Model Selection
-    model = genai.GenerativeModel('gemini-1.5-flash') 
+    
+    # ---------------------------------------------------------
+    # FIX: AUTO-DETECT A WORKING MODEL (No more 404 Errors)
+    # ---------------------------------------------------------
+    active_model = None
+    try:
+        # 1. Try to find a Flash model (fastest)
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                if 'flash' in m.name:
+                    active_model = m.name
+                    break
+        
+        # 2. If no Flash, find ANY generating model (Pro, etc.)
+        if not active_model:
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    active_model = m.name
+                    break
+                    
+    except Exception as e:
+        return f"❌ Model Listing Failed: {str(e)}"
+
+    # Fallback if auto-detect fails entirely
+    if not active_model:
+        active_model = "gemini-pro"
+    # ---------------------------------------------------------
+
+    model = genai.GenerativeModel(active_model)
     
     prompt = f"""
     DOCUMENT CONTENT:
-    {context[:20000]} 
+    {context[:30000]} 
     
     TASK: {task}
     
@@ -49,16 +76,16 @@ def ask_the_brain(task, context, key):
     """
     try:
         response = model.generate_content(prompt)
-        return f"✅ **ANALYSIS COMPLETE:**\n\n{response.text}"
+        return f"✅ **ANALYSIS COMPLETE ({active_model}):**\n\n{response.text}"
     except Exception as e:
-        return f"❌ Analysis Failed: {str(e)}"
+        return f"❌ Analysis Failed with {active_model}: {str(e)}"
 
 # --- MAIN APP ---
 if 'plan' not in st.session_state:
     st.session_state['plan'] = None
 
 user_goal = st.text_area("Enter your Goal:", 
-                          "Summarize this project report and list all the costs.")
+                          "Analyze my CV and suggest 3 best job roles.")
 
 # 1. GENERATE PLAN
 if st.button("1. Generate Plan"):
@@ -83,6 +110,8 @@ if st.session_state['plan']:
     plan = st.session_state['plan']
     
     st.subheader("📋 The Strategy")
+    st.info(plan.get('thought_process', 'Executing plan...'))
+    
     for step in plan.get('steps', []):
         st.write(f"**Step {step['step']} ({step['action']}):** {step.get('query') or step.get('target')}")
     
@@ -95,31 +124,9 @@ if st.session_state['plan']:
         
         for i, step in enumerate(steps):
             action_type = step.get('action', '').lower()
-            query = step.get('query') or step.get('target')
+            query = step.get('query') or step.get('target') or "No query"
             
             with st.chat_message("assistant"):
                 st.write(f"**Step {step['step']}: {action_type.upper()}**")
                 
-                # --- THE SMART SWITCH ---
-                # If action is 'search', use Hunter (Google).
-                # If action is 'analyze', 'summarize', 'extract', use Brain (PDF).
-                if "search" in action_type and not pdf_context:
-                    # No PDF? Must search web.
-                    result = execute_step(step)
-                elif "search" in action_type and "google" in query.lower():
-                    # Explicitly asked to search? Use Hunter.
-                    result = execute_step(step)
-                else:
-                    # Default: If we have a PDF, assume it's an analysis task
-                    if pdf_context:
-                        result = ask_the_brain(query, pdf_context, api_key)
-                    else:
-                        # Fallback to search if no PDF exists
-                        result = execute_step(step)
-                
-                st.markdown(result)
-            
-            progress_bar.progress((i + 1) / len(steps))
-            time.sleep(1)
-            
-        st.success("Mission Complete!")
+                # ---
