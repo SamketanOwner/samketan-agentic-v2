@@ -1,152 +1,71 @@
 import streamlit as st
-import time
 import google.generativeai as genai
-from pypdf import PdfReader
-from architect import get_architect_plan
-from hunter import execute_step
+from PIL import Image
 
-st.set_page_config(page_title="Samketan V3: Universal Agent", page_icon="🌍")
+st.set_page_config(page_title="Samketan Marketing Studio", page_icon="📸")
 
-st.title("Samketan V3: Universal Agent 🌍")
-st.caption("Auto-Switching: Web Search ↔️ Document Reading")
+st.title("Samketan AI: Marketing Factory 🚀")
+st.caption("Upload a product photo ➔ Get ready-to-post social media campaigns")
 
-# --- SIDEBAR: SETTINGS ---
+# --- SIDEBAR: SETTINGS & UPLOAD ---
+st.sidebar.header("⚙️ Settings")
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
     st.sidebar.success("✅ API Key Loaded")
 else:
     api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
 
-# --- SIDEBAR: DOC READER ---
 st.sidebar.markdown("---")
-st.sidebar.header("📂 Document Intelligence")
-uploaded_file = st.sidebar.file_uploader("Upload PDF (CV/Tender/Report)", type="pdf")
+st.sidebar.header("📸 Visual Input")
+uploaded_file = st.sidebar.file_uploader("Upload Product/Warehouse Photo", type=["jpg", "jpeg", "png"])
 
-pdf_context = ""
+image = None
 if uploaded_file is not None:
-    try:
-        reader = PdfReader(uploaded_file)
-        for page in reader.pages:
-            pdf_context += page.extract_text()
-        st.sidebar.success(f"✅ Loaded {len(reader.pages)} pages.")
-    except Exception as e:
-        st.sidebar.error(f"Error reading PDF: {e}")
+    image = Image.open(uploaded_file)
+    st.sidebar.image(image, caption="Product Preview", use_container_width=True)
 
-# --- INTERNAL BRAIN FUNCTION (ROBUST) ---
-def ask_the_brain(task, context, key):
-    """Uses Gemini to analyze the PDF directly."""
-    genai.configure(api_key=key)
-    
-    # ---------------------------------------------------------
-    # FIX: AUTO-DETECT A WORKING MODEL (No more 404 Errors)
-    # ---------------------------------------------------------
-    active_model = None
-    try:
-        # 1. Try to find a Flash model (fastest)
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                if 'flash' in m.name:
-                    active_model = m.name
-                    break
-        
-        # 2. If no Flash, find ANY generating model (Pro, etc.)
-        if not active_model:
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    active_model = m.name
-                    break
-                    
-    except Exception as e:
-        return f"❌ Model Listing Failed: {str(e)}"
+# --- MAIN SCREEN ---
+product_context = st.text_input("What are we selling?", placeholder="e.g., Premium Grade Toor Dal from Kalaburagi")
+target_audience = st.selectbox("Who is the target audience?", ["B2B (Wholesalers, Supermarkets)", "B2C (Direct Consumers)", "Corporate (For Warehouse Space)"])
 
-    # Fallback if auto-detect fails entirely
-    if not active_model:
-        active_model = "gemini-pro"
-    # ---------------------------------------------------------
-
-    model = genai.GenerativeModel(active_model)
-    
-    prompt = f"""
-    DOCUMENT CONTENT:
-    {context[:30000]} 
-    
-    TASK: {task}
-    
-    INSTRUCTION: Provide a clear, direct answer based ONLY on the document above.
-    """
-    try:
-        response = model.generate_content(prompt)
-        return f"✅ **ANALYSIS COMPLETE ({active_model}):**\n\n{response.text}"
-    except Exception as e:
-        return f"❌ Analysis Failed with {active_model}: {str(e)}"
-
-# --- MAIN APP ---
-if 'plan' not in st.session_state:
-    st.session_state['plan'] = None
-
-user_goal = st.text_area("Enter your Goal:", 
-                          "Analyze my CV and suggest 3 best job roles.")
-
-# 1. GENERATE PLAN
-if st.button("1. Generate Plan"):
+if st.button("Generate Marketing Campaign"):
     if not api_key:
-        st.error("Need API Key!")
+        st.error("Please enter your API Key!")
+    elif not image:
+        st.warning("Please upload a product photo first!")
     else:
-        # Combine PDF context with user goal for the Architect
-        full_query = user_goal
-        if pdf_context:
-            full_query = f"CONTEXT FROM PDF:\n{pdf_context[:10000]}\n\nUSER GOAL: {user_goal}"
+        with st.spinner("Creative Director is analyzing the image and writing copy..."):
+            genai.configure(api_key=api_key)
             
-        with st.spinner("Architect is planning..."):
-            plan = get_architect_plan(full_query, api_key)
-            if "error" in plan:
-                st.error(plan['error'])
-            else:
-                st.session_state['plan'] = plan
-                st.success("Plan Created!")
-
-# 2. EXECUTE PLAN
-if st.session_state['plan']:
-    plan = st.session_state['plan']
-    
-    st.subheader("📋 The Strategy")
-    st.info(plan.get('thought_process', 'Executing plan...'))
-    
-    for step in plan.get('steps', []):
-        st.write(f"**Step {step['step']} ({step['action']}):** {step.get('query') or step.get('target')}")
-    
-    st.markdown("---")
-    
-    if st.button("2. Execute Mission"):
-        st.write("🚀 **Starting Hybrid Execution...**")
-        progress_bar = st.progress(0)
-        steps = plan.get('steps', [])
-        
-        for i, step in enumerate(steps):
-            action_type = step.get('action', '').lower()
-            query = step.get('query') or step.get('target') or "No query"
+            # Using the Flash model as it has excellent vision capabilities
+            model = genai.GenerativeModel('gemini-1.5-flash')
             
-            with st.chat_message("assistant"):
-                st.write(f"**Step {step['step']}: {action_type.upper()}**")
-                
-                # --- THE SMART SWITCH (STRICT MODE) ---
-                result = ""
-                
-                # CASE 1: SEARCH tasks MUST go to Hunter (Web)
-                if "search" in action_type:
-                    result = execute_step(step)
-                
-                # CASE 2: ANALYZE tasks with PDF go to Brain (Gemini)
-                elif pdf_context and ("analyze" in action_type or "summarize" in action_type or "extract" in action_type):
-                    result = ask_the_brain(query, pdf_context, api_key)
-                
-                # CASE 3: Fallback (If no PDF, but asked to analyze, default to search or generic brain)
-                else:
-                    result = execute_step(step)
-                
-                st.markdown(result)
+            prompt = f"""
+            You are an expert Social Media Manager and Creative Director.
+            Analyze the attached image.
             
-            progress_bar.progress((i + 1) / len(steps))
-            time.sleep(1)
+            Product Context: {product_context}
+            Target Audience: {target_audience}
             
-        st.success("Mission Complete!")
+            Create a complete, ready-to-publish marketing campaign. Format your output strictly with these headings:
+            
+            ### 👔 LinkedIn Post (Professional)
+            Write a B2B focused post highlighting supply chain, quality, or business value. Include relevant professional hashtags.
+            
+            ### 📸 Instagram & Facebook Post (Consumer)
+            Write a catchy, highly engaging post with emojis and viral hashtags. Make it visually appealing in text form.
+            
+            ### 💬 WhatsApp Broadcast
+            Write a short, direct message suitable for forwarding. Include a clear Call to Action (CTA).
+            
+            ### 🎨 Poster Design Instructions
+            Give the graphic designer 3 bullet points on exactly what text to overlay on this image to make a highly converting poster.
+            """
+            
+            try:
+                # We pass BOTH the prompt text and the image to the AI
+                response = model.generate_content([prompt, image])
+                st.success("✅ Campaign Generated Successfully!")
+                st.markdown(response.text)
+            except Exception as e:
+                st.error(f"Failed to generate campaign: {e}")
