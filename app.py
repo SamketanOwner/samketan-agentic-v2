@@ -37,8 +37,26 @@ if st.button("Generate Marketing Campaign"):
         with st.spinner("Creative Director is analyzing the image and writing copy..."):
             genai.configure(api_key=api_key)
             
-            # Using the Flash model as it has excellent vision capabilities
-            model = genai.GenerativeModel('gemini-1.5-flash')
+            # --- THE FIX: AUTO-DETECT A WORKING VISION MODEL ---
+            active_model = None
+            try:
+                for m in genai.list_models():
+                    if 'generateContent' in m.supported_generation_methods:
+                        # Look for models that specifically handle vision/images (1.5 series or pro-vision)
+                        if '1.5' in m.name or 'vision' in m.name:
+                            active_model = m.name
+                            break
+            except Exception as e:
+                st.error(f"Error checking models: {e}")
+                
+            # Absolute fallback if the loop fails
+            if not active_model:
+                active_model = "gemini-1.5-flash-latest" 
+            
+            st.info(f"Connected to model: {active_model}")
+            # ----------------------------------------------------
+            
+            model = genai.GenerativeModel(active_model)
             
             prompt = f"""
             You are an expert Social Media Manager and Creative Director.
@@ -63,9 +81,8 @@ if st.button("Generate Marketing Campaign"):
             """
             
             try:
-                # We pass BOTH the prompt text and the image to the AI
                 response = model.generate_content([prompt, image])
                 st.success("✅ Campaign Generated Successfully!")
                 st.markdown(response.text)
             except Exception as e:
-                st.error(f"Failed to generate campaign: {e}")
+                st.error(f"Failed to generate campaign with {active_model}: {e}")
