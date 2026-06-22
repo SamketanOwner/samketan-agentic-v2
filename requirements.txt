@@ -8,7 +8,6 @@ google-api-python-client>=2.100.0
 moviepy>=1.0.3
 imageio>=2.33.0
 imageio-ffmpeg>=0.4.9
-ffmpeg-python>=0.2.1
 pyttsx3>=2.90
 mutagen>=1.46.0
 PyYAML>=6.0
