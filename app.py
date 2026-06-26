@@ -17,6 +17,7 @@ import os
 import re
 import tempfile
 import zipfile
+import numpy as np
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -418,6 +419,27 @@ def overlay_logo(base_image: Image.Image, logo: Optional[Image.Image], position:
     return img
 
 
+def create_gradient_overlay(size: Tuple[int, int], direction: str = "bottom") -> Image.Image:
+    """Create a smooth gradient overlay for better text readability."""
+    width, height = size
+    gradient = Image.new('RGBA', size, (0, 0, 0, 0))
+
+    for y in range(height):
+        if direction == "bottom":
+            alpha = int(180 * (y / height) ** 1.5)  # Stronger at bottom
+        elif direction == "top":
+            alpha = int(180 * ((height - y) / height) ** 1.5)
+        elif direction == "center":
+            alpha = int(160 * (1 - abs(y - height//2) / (height//2)) ** 2)
+        else:
+            alpha = 120
+
+        for x in range(width):
+            gradient.putpixel((x, y), (0, 0, 0, alpha))
+
+    return gradient
+
+
 def make_poster(
     image: Image.Image,
     logo: Optional[Image.Image],
@@ -428,10 +450,24 @@ def make_poster(
 ) -> Image.Image:
     width, height = size
     base = ImageOps.fit(ImageOps.exif_transpose(image).convert("RGB"), size, method=Image.Resampling.LANCZOS)
-    base = ImageEnhance.Contrast(base).enhance(1.05)
 
-    overlay = Image.new("RGBA", size, (0, 0, 0, 110))
-    poster = Image.alpha_composite(base.convert("RGBA"), overlay)
+    # Enhance image
+    base = ImageEnhance.Contrast(base).enhance(1.08)
+    base = ImageEnhance.Sharpness(base).enhance(1.1)
+    base = ImageEnhance.Color(base).enhance(1.05)
+
+    # Apply gradient overlay for text readability
+    gradient = create_gradient_overlay(size, direction="bottom")
+    poster = Image.alpha_composite(base.convert("RGBA"), gradient)
+
+    # Add subtle vignette
+    vignette = Image.new("RGBA", size, (0, 0, 0, 0))
+    v_draw = ImageDraw.Draw(vignette)
+    for i in range(max(width, height) // 2, 0, -2):
+        alpha = int(30 * (1 - i / (max(width, height) // 2)))
+        v_draw.ellipse([width//2 - i, height//2 - i, width//2 + i, height//2 + i], 
+                       outline=(0, 0, 0, alpha))
+    poster = Image.alpha_composite(poster, vignette)
 
     # Add logo
     poster = overlay_logo(poster, logo, position="top-right")
@@ -441,58 +477,117 @@ def make_poster(
     accent_rgb = tuple(int(accent.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4))
     text_rgb = tuple(int(text_color.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4))
 
-    margin = max(40, width // 18)
-    title_font = get_font(max(44, width // 12), bold=True)
-    tagline_font = get_font(max(28, width // 28))
-    cta_font = get_font(max(24, width // 32), bold=True)
-    brand_font = get_font(max(20, width // 44), bold=True)
+    margin = max(40, width // 16)
 
+    # Dynamic font sizing based on image size
+    title_font = get_font(max(52, width // 10), bold=True)
+    tagline_font = get_font(max(32, width // 24))
+    cta_font = get_font(max(28, width // 28), bold=True)
+    brand_font = get_font(max(22, width // 40), bold=True)
+
+    # Brand badge with shadow effect
+    badge_w = max(240, width // 3.5)
+    badge_h = 60
+    # Shadow
     draw.rounded_rectangle(
-        (margin, margin, margin + max(220, width // 4), margin + 54),
-        radius=8,
-        fill=(255, 255, 255, 225),
+        (margin + 3, margin + 3, margin + badge_w + 3, margin + badge_h + 3),
+        radius=10,
+        fill=(0, 0, 0, 100),
+    )
+    # Main badge
+    draw.rounded_rectangle(
+        (margin, margin, margin + badge_w, margin + badge_h),
+        radius=10,
+        fill=(255, 255, 255, 240),
     )
     draw.text((margin + 20, margin + 16), "SAMKETAN", font=brand_font, fill=(20, 25, 35))
 
+    # Main headline with text shadow for depth
+    headline = campaign["poster_main_text"]
+    headline_y = height // 2 - height // 10
+
+    # Shadow text
     draw_centered_multiline(
         draw,
-        (width // 2, height // 2 - height // 12),
-        campaign["poster_main_text"],
+        (width // 2 + 2, headline_y + 2),
+        headline,
+        title_font,
+        (0, 0, 0),
+        width - margin * 2,
+        line_gap=max(8, width // 90),
+    )
+    # Main text
+    draw_centered_multiline(
+        draw,
+        (width // 2, headline_y),
+        headline,
         title_font,
         text_rgb,
         width - margin * 2,
         line_gap=max(8, width // 90),
     )
 
+    # Tagline with accent background
     tagline = campaign.get("poster_tagline", "")
-    tag_w, tag_h = text_size(draw, tagline, tagline_font)
-    tag_y = height // 2 + height // 10
-    draw.rounded_rectangle(
-        (
-            width // 2 - tag_w // 2 - 28,
-            tag_y - 14,
-            width // 2 + tag_w // 2 + 28,
-            tag_y + tag_h + 18,
-        ),
-        radius=8,
-        fill=accent_rgb + (230,),
-    )
-    draw.text((width // 2 - tag_w // 2, tag_y), tagline, font=tagline_font, fill=(255, 255, 255))
+    if tagline:
+        tag_w, tag_h = text_size(draw, tagline, tagline_font)
+        tag_y = height // 2 + height // 12
 
+        # Shadow
+        draw.rounded_rectangle(
+            (
+                width // 2 - tag_w // 2 - 30 + 2,
+                tag_y - 16 + 2,
+                width // 2 + tag_w // 2 + 30 + 2,
+                tag_y + tag_h + 20 + 2,
+            ),
+            radius=10,
+            fill=(0, 0, 0, 80),
+        )
+        # Main
+        draw.rounded_rectangle(
+            (
+                width // 2 - tag_w // 2 - 30,
+                tag_y - 16,
+                width // 2 + tag_w // 2 + 30,
+                tag_y + tag_h + 20,
+            ),
+            radius=10,
+            fill=accent_rgb + (235,),
+        )
+        draw.text((width // 2 - tag_w // 2, tag_y), tagline, font=tagline_font, fill=(255, 255, 255))
+
+    # CTA button with glow effect
     cta = campaign.get("poster_cta", "Order now")
     cta_w, cta_h = text_size(draw, cta, cta_font)
-    cta_y = height - margin - 78
+    cta_y = height - margin - 90
+
+    # Glow
+    for glow_offset in range(3, 0, -1):
+        glow_alpha = 40 - glow_offset * 10
+        draw.rounded_rectangle(
+            (
+                width // 2 - cta_w // 2 - 45 - glow_offset,
+                cta_y - glow_offset,
+                width // 2 + cta_w // 2 + 45 + glow_offset,
+                cta_y + cta_h + 38 + glow_offset,
+            ),
+            radius=12,
+            fill=accent_rgb + (glow_alpha,),
+        )
+
+    # Main button
     draw.rounded_rectangle(
         (
-            width // 2 - cta_w // 2 - 42,
+            width // 2 - cta_w // 2 - 45,
             cta_y,
-            width // 2 + cta_w // 2 + 42,
-            cta_y + cta_h + 34,
+            width // 2 + cta_w // 2 + 45,
+            cta_y + cta_h + 38,
         ),
-        radius=8,
-        fill=(255, 255, 255, 238),
+        radius=10,
+        fill=(255, 255, 255, 245),
     )
-    draw.text((width // 2 - cta_w // 2, cta_y + 17), cta, font=cta_font, fill=accent_rgb)
+    draw.text((width // 2 - cta_w // 2, cta_y + 19), cta, font=cta_font, fill=accent_rgb)
 
     return poster.convert("RGB")
 
@@ -731,48 +826,431 @@ def make_achievement_card(
     return card
 
 
-def make_video_frame(
+
+
+def create_background_music(duration: float, tempo: str = "medium") -> str:
+    """Generate simple background music using numpy/audio processing."""
+    import numpy as np
+    from scipy.io.wavfile import write
+
+    sample_rate = 44100
+    total_samples = int(duration * sample_rate)
+
+    # Create a simple ambient pad
+    t = np.linspace(0, duration, total_samples, False)
+
+    # Base frequencies for ambient feel
+    if tempo == "slow":
+        base_freq = 220  # A3
+        beat_freq = 0.5
+    elif tempo == "fast":
+        base_freq = 330  # E4
+        beat_freq = 2.0
+    else:  # medium
+        base_freq = 261.63  # C4
+        beat_freq = 1.0
+
+    # Layer multiple sine waves for richness
+    wave1 = 0.3 * np.sin(2 * np.pi * base_freq * t)
+    wave2 = 0.2 * np.sin(2 * np.pi * base_freq * 1.5 * t)  # Perfect fifth
+    wave3 = 0.15 * np.sin(2 * np.pi * base_freq * 2 * t)   # Octave
+    wave4 = 0.1 * np.sin(2 * np.pi * base_freq * 1.25 * t) # Major third
+
+    # Add slow amplitude modulation (tremolo)
+    tremolo = 0.5 + 0.5 * np.sin(2 * np.pi * beat_freq * t)
+
+    # Combine waves
+    audio = (wave1 + wave2 + wave3 + wave4) * tremolo
+
+    # Apply fade in/out
+    fade_samples = int(2 * sample_rate)  # 2 second fade
+    if len(audio) > 2 * fade_samples:
+        fade_in = np.linspace(0, 1, fade_samples)
+        fade_out = np.linspace(1, 0, fade_samples)
+        audio[:fade_samples] *= fade_in
+        audio[-fade_samples:] *= fade_out
+
+    # Normalize
+    audio = audio / np.max(np.abs(audio)) * 0.3  # Keep volume moderate
+
+    # Convert to 16-bit PCM
+    audio_int16 = (audio * 32767).astype(np.int16)
+
+    # Save
+    music_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    write(music_file.name, sample_rate, audio_int16)
+    music_file.close()
+    return music_file.name
+
+
+def apply_ken_burns(image: Image.Image, size: Tuple[int, int], duration: float, 
+                    zoom_direction: str = "in", pan_direction: str = "none") -> list:
+    """Generate frames with Ken Burns effect (slow zoom and pan)."""
+    from PIL import Image
+    import numpy as np
+
+    fps = 24
+    total_frames = int(duration * fps)
+    frames = []
+
+    # Start and end zoom levels
+    if zoom_direction == "in":
+        start_scale = 1.0
+        end_scale = 1.15
+    elif zoom_direction == "out":
+        start_scale = 1.15
+        end_scale = 1.0
+    else:
+        start_scale = 1.0
+        end_scale = 1.0
+
+    # Pan offsets
+    pan_offsets = {
+        "none": (0, 0),
+        "left": (-0.05, 0),
+        "right": (0.05, 0),
+        "up": (0, -0.05),
+        "down": (0, 0.05),
+        "diagonal": (0.03, -0.03)
+    }
+
+    start_pan = pan_offsets.get(pan_direction, (0, 0))
+    end_pan = (-start_pan[0], -start_pan[1])  # Reverse for smooth motion
+
+    for i in range(total_frames):
+        progress = i / (total_frames - 1) if total_frames > 1 else 0
+
+        # Interpolate scale
+        scale = start_scale + (end_scale - start_scale) * progress
+
+        # Interpolate pan
+        pan_x = start_pan[0] + (end_pan[0] - start_pan[0]) * progress
+        pan_y = start_pan[1] + (end_pan[1] - start_pan[1]) * progress
+
+        # Calculate crop box
+        new_w = int(size[0] / scale)
+        new_h = int(size[1] / scale)
+
+        # Center point with pan offset
+        center_x = size[0] // 2 + int(pan_x * size[0])
+        center_y = size[1] // 2 + int(pan_y * size[1])
+
+        left = max(0, center_x - new_w // 2)
+        top = max(0, center_y - new_h // 2)
+        right = min(image.width, left + new_w)
+        bottom = min(image.height, top + new_h)
+
+        # Adjust if out of bounds
+        if right - left < new_w:
+            left = max(0, right - new_w)
+        if bottom - top < new_h:
+            top = max(0, bottom - new_h)
+
+        # Crop and resize
+        cropped = image.crop((left, top, right, bottom))
+        frame = cropped.resize(size, Image.Resampling.LANCZOS)
+        frames.append(np.array(frame))
+
+    return frames
+
+
+def create_text_overlay_frame(base_frame: np.ndarray, text: str, subtext: str = "",
+                               position: str = "bottom", accent_color: Tuple[int, int, int] = (15, 118, 110),
+                               animation_progress: float = 0.5) -> np.ndarray:
+    """Add animated text overlay to a frame."""
+    from PIL import Image, ImageDraw, ImageFont
+    import numpy as np
+
+    img = Image.fromarray(base_frame)
+    draw = ImageDraw.Draw(img)
+    width, height = img.size
+
+    # Font sizes
+    title_font = get_font(max(48, width // 14), bold=True)
+    sub_font = get_font(max(28, width // 32))
+
+    # Animation: fade in + slide up
+    alpha = min(1.0, animation_progress * 2)  # Fade in over first half
+    slide_offset = int((1 - alpha) * 30)  # Slide up 30 pixels
+
+    # Text color with alpha
+    text_color = (255, 255, 255)
+
+    # Background band
+    band_height = max(200, height // 4)
+    if position == "bottom":
+        band_y = height - band_height
+    else:
+        band_y = 0
+
+    # Semi-transparent band
+    overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rectangle((0, band_y, width, band_y + band_height), 
+                           fill=(0, 0, 0, int(180 * alpha)))
+
+    # Accent line
+    line_y = band_y if position == "top" else band_y + band_height - 8
+    overlay_draw.rectangle((0, line_y, width, line_y + 8), 
+                           fill=accent_color + (int(255 * alpha),))
+
+    # Composite overlay
+    img = Image.alpha_composite(img.convert('RGBA'), overlay).convert('RGB')
+    draw = ImageDraw.Draw(img)
+
+    # Draw text
+    text_y = band_y + band_height // 2 - 20 + slide_offset
+
+    # Wrap and center text
+    max_text_width = width - 80
+    wrapped = wrap_text(draw, text, title_font, max_text_width)
+    lines = wrapped.split('\n')
+
+    total_text_height = sum(text_size(draw, line, title_font)[1] for line in lines)
+    if subtext:
+        total_text_height += text_size(draw, subtext, sub_font)[1] + 15
+
+    current_y = text_y - total_text_height // 2
+
+    for line in lines:
+        line_w, line_h = text_size(draw, line, title_font)
+        draw.text((width // 2 - line_w // 2, current_y), line, 
+                  font=title_font, fill=text_color)
+        current_y += line_h + 8
+
+    if subtext:
+        sub_w, sub_h = text_size(draw, subtext, sub_font)
+        draw.text((width // 2 - sub_w // 2, current_y + 10), subtext,
+                  font=sub_font, fill=(200, 200, 200))
+
+    return np.array(img)
+
+
+def create_scene_transition(frame1: np.ndarray, frame2: np.ndarray, 
+                            duration: float = 0.5, transition_type: str = "fade") -> list:
+    """Create transition frames between two scenes."""
+    import numpy as np
+    fps = 24
+    total_frames = int(duration * fps)
+    frames = []
+
+    for i in range(total_frames):
+        progress = i / (total_frames - 1) if total_frames > 1 else 0
+
+        if transition_type == "fade":
+            # Crossfade
+            frame = (1 - progress) * frame1.astype(float) + progress * frame2.astype(float)
+            frames.append(frame.astype(np.uint8))
+        elif transition_type == "slide":
+            # Slide transition
+            h, w = frame1.shape[:2]
+            offset = int(w * progress)
+            result = np.zeros_like(frame1)
+            result[:, :w-offset] = frame1[:, offset:]
+            result[:, w-offset:] = frame2[:, :offset]
+            frames.append(result)
+        else:
+            frames.append(frame1 if progress < 0.5 else frame2)
+
+    return frames
+
+
+def create_professional_video(
+    images: List[Image.Image],
+    logo: Optional[Image.Image],
+    campaign: Dict[str, Any],
+    size: Tuple[int, int],
+    duration: int,
+    accent: str,
+    audio_path: Optional[str],
+    include_music: bool = True,
+    music_tempo: str = "medium",
+) -> str:
+    """Create a professional multi-scene video with effects."""
+    from moviepy.editor import AudioFileClip, ImageSequenceClip, CompositeAudioClip
+    from moviepy.audio.fx.all import audio_fadein, audio_fadeout
+    import numpy as np
+
+    fps = 24
+    accent_rgb = tuple(int(accent.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+
+    # Prepare images
+    prepared_images = []
+    for img in images[:4]:  # Use up to 4 images
+        prepared = ImageOps.fit(ImageOps.exif_transpose(img).convert("RGB"), 
+                                size, method=Image.Resampling.LANCZOS)
+        prepared_images.append(prepared)
+
+    # If only one image, duplicate it
+    while len(prepared_images) < 2:
+        prepared_images.append(prepared_images[0])
+
+    # Scene definitions
+    scenes = []
+    scene_duration = duration / len(prepared_images)
+
+    headlines = [
+        campaign.get("headline", "Premium Quality"),
+        campaign.get("poster_main_text", "Trusted Supply"),
+        campaign.get("poster_tagline", "Order Now"),
+        "Contact Us Today"
+    ]
+
+    subtexts = [
+        campaign.get("business_name", "Samketan Marketing"),
+        campaign.get("product_name", ""),
+        campaign.get("poster_cta", ""),
+        ""
+    ]
+
+    zoom_dirs = ["in", "out", "in", "out"]
+    pan_dirs = ["none", "left", "right", "diagonal"]
+
+    all_frames = []
+
+    for idx, (img, headline, subtext, zoom, pan) in enumerate(
+        zip(prepared_images, headlines, subtexts, zoom_dirs, pan_dirs)
+    ):
+        # Generate Ken Burns frames
+        kb_frames = apply_ken_burns(img, size, scene_duration, zoom, pan)
+
+        # Add text overlays with animation
+        scene_frames = []
+        for frame_idx, frame in enumerate(kb_frames):
+            anim_progress = frame_idx / len(kb_frames) if kb_frames else 0
+            # Delay text appearance slightly
+            text_progress = max(0, (anim_progress - 0.1) / 0.9)
+
+            frame_with_text = create_text_overlay_frame(
+                frame, headline, subtext,
+                position="bottom", accent_color=accent_rgb,
+                animation_progress=text_progress
+            )
+
+            # Add logo watermark
+            if logo is not None:
+                pil_frame = Image.fromarray(frame_with_text)
+                pil_frame = overlay_logo_watermark(pil_frame, logo)
+                frame_with_text = np.array(pil_frame)
+
+            scene_frames.append(frame_with_text)
+
+        all_frames.extend(scene_frames)
+
+        # Add transition to next scene (except for last)
+        if idx < len(prepared_images) - 1:
+            next_img = prepared_images[idx + 1]
+            next_kb = apply_ken_burns(next_img, size, 0.5, zoom_dirs[idx+1], pan_dirs[idx+1])
+            first_next = next_kb[0] if next_kb else np.zeros_like(frame)
+
+            transition = create_scene_transition(
+                scene_frames[-1], first_next, 0.5, "fade"
+            )
+            all_frames.extend(transition)
+
+    # Create video clip
+    video_clip = ImageSequenceClip(all_frames, fps=fps)
+
+    # Handle audio
+    audio_clips = []
+
+    # Background music
+    if include_music:
+        music_path = create_background_music(video_clip.duration, music_tempo)
+        music_clip = AudioFileClip(music_path)
+        # Loop music if needed
+        if music_clip.duration < video_clip.duration:
+            loops = int(video_clip.duration / music_clip.duration) + 1
+            music_clip = CompositeAudioClip([music_clip] * loops).subclip(0, video_clip.duration)
+        else:
+            music_clip = music_clip.subclip(0, video_clip.duration)
+        # Lower music volume
+        music_clip = music_clip.volumex(0.3)
+        music_clip = audio_fadein(music_clip, 2).fx(audio_fadeout, 2)
+        audio_clips.append(music_clip)
+
+    # TTS narration
+    if audio_path:
+        tts_clip = AudioFileClip(audio_path)
+        tts_clip = tts_clip.volumex(0.8)
+        audio_clips.append(tts_clip)
+
+    # Combine audio
+    if audio_clips:
+        final_audio = CompositeAudioClip(audio_clips)
+        video_clip = video_clip.set_audio(final_audio)
+
+    # Export
+    output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    output.close()
+    video_clip.write_videofile(
+        output.name,
+        fps=fps,
+        codec="libx264",
+        audio_codec="aac",
+        preset="medium",
+        verbose=False,
+        logger=None,
+    )
+
+    video_clip.close()
+    for clip in audio_clips:
+        clip.close()
+
+    return output.name
+
+
+def overlay_logo_watermark(base_image: Image.Image, logo: Image.Image, 
+                           opacity: float = 0.8) -> Image.Image:
+    """Add a subtle logo watermark to the corner."""
+    img = base_image.copy().convert("RGBA")
+    logo_rgba = ImageOps.exif_transpose(logo).convert("RGBA")
+
+    # Resize logo small
+    max_logo_width = max(60, img.width // 10)
+    ratio = max_logo_width / logo_rgba.width
+    new_size = (max_logo_width, int(logo_rgba.height * ratio))
+    logo_rgba = logo_rgba.resize(new_size, Image.Resampling.LANCZOS)
+
+    # Apply opacity
+    logo_data = np.array(logo_rgba)
+    logo_data[..., 3] = (logo_data[..., 3] * opacity).astype(np.uint8)
+    logo_rgba = Image.fromarray(logo_data)
+
+    # Position: top-right
+    margin = max(15, img.width // 50)
+    pos = (img.width - logo_rgba.width - margin, margin)
+
+    img.paste(logo_rgba, pos, logo_rgba)
+    return img.convert("RGB")
+
+
+# Replace the old create_video function
+def create_video(
     image: Image.Image,
     logo: Optional[Image.Image],
     campaign: Dict[str, Any],
     size: Tuple[int, int],
+    duration: int,
     accent: str,
-) -> Image.Image:
-    width, height = size
-    frame = ImageOps.fit(ImageOps.exif_transpose(image).convert("RGB"), size, method=Image.Resampling.LANCZOS)
-    overlay = Image.new("RGBA", size, (0, 0, 0, 70))
-    frame = Image.alpha_composite(frame.convert("RGBA"), overlay)
+    audio_path: Optional[str],
+) -> str:
+    """Wrapper that uses the professional video engine with multiple images if available."""
+    images = [image]
+    if "uploaded_images" in st.session_state and st.session_state.uploaded_images:
+        images = st.session_state.uploaded_images[:4]
 
-    # Add logo
-    frame = overlay_logo(frame, logo, position="top-right")
-
-    draw = ImageDraw.Draw(frame)
-
-    accent_rgb = tuple(int(accent.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4))
-    title_font = get_font(max(42, width // 16), bold=True)
-    small_font = get_font(max(22, width // 45), bold=True)
-    margin = max(36, width // 22)
-
-    band_height = max(250, height // 5)
-    draw.rectangle((0, height - band_height, width, height), fill=(0, 0, 0, 178))
-    draw.rectangle((0, height - band_height, 12, height), fill=accent_rgb + (255,))
-
-    headline = campaign.get("headline") or campaign.get("poster_main_text") or "Samketan"
-    draw_centered_multiline(
-        draw,
-        (width // 2, height - band_height // 2 - 10),
-        headline,
-        title_font,
-        (255, 255, 255),
-        width - margin * 2,
-        line_gap=8,
+    return create_professional_video(
+        images=images,
+        logo=logo,
+        campaign=campaign,
+        size=size,
+        duration=duration,
+        accent=accent,
+        audio_path=audio_path,
+        include_music=True,
+        music_tempo="medium",
     )
-
-    footer = "Samketan Marketing Factory"
-    footer_w, footer_h = text_size(draw, footer, small_font)
-    draw.rounded_rectangle((margin, margin, margin + footer_w + 30, margin + footer_h + 22), radius=8, fill=(255, 255, 255, 220))
-    draw.text((margin + 15, margin + 11), footer, font=small_font, fill=(20, 25, 35))
-    return frame.convert("RGB")
 
 
 def create_tts_audio(narration: str, service_account_info: Dict[str, Any], speed: float) -> Optional[str]:
@@ -1197,6 +1675,105 @@ with tabs[1]:
         c3.markdown(f"<div class='metric-card'><b>Hashtags</b><br>{len(campaign.get('hashtags', []))}</div>", unsafe_allow_html=True)
         c4.markdown(f"<div class='metric-card'><b>Event</b><br>{st.session_state.get('event_type', 'None')}</div>", unsafe_allow_html=True)
 
+        # ── YOUR KIT DASHBOARD ──
+        st.divider()
+        st.subheader("📦 Your Marketing Kit Dashboard")
+        st.caption("Everything generated is stored here. Click any card to jump to that tab.")
+
+        kit_col1, kit_col2, kit_col3, kit_col4 = st.columns(4)
+
+        with kit_col1:
+            poster_ready = "poster" in st.session_state
+            video_ready = "video_path" in st.session_state
+            st.markdown(f"""
+            <div class='metric-card' style='border-left: 4px solid {"#10b981" if poster_ready else "#e5e7eb"};'>
+                <b>🖼️ Poster</b><br>
+                <span style='color: {"#10b981" if poster_ready else "#9ca3af"}; font-size: 0.85rem;'>
+                    {"✅ Ready — go to Poster tab" if poster_ready else "⏳ Not generated yet"}
+                </span>
+            </div>
+            <div class='metric-card' style='border-left: 4px solid {"#10b981" if video_ready else "#e5e7eb"}; margin-top: 8px;'>
+                <b>🎬 Video</b><br>
+                <span style='color: {"#10b981" if video_ready else "#9ca3af"}; font-size: 0.85rem;'>
+                    {"✅ Ready — go to Video tab" if video_ready else "⏳ Not generated yet"}
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with kit_col2:
+            invite_ready = "invitation" in st.session_state
+            proc_ready = "proceedings" in st.session_state
+            st.markdown(f"""
+            <div class='metric-card' style='border-left: 4px solid {"#10b981" if invite_ready else "#e5e7eb"};'>
+                <b>📨 Invitation</b><br>
+                <span style='color: {"#10b981" if invite_ready else "#9ca3af"}; font-size: 0.85rem;'>
+                    {"✅ Ready — go to Invitation tab" if invite_ready else "⏳ Not generated yet"}
+                </span>
+            </div>
+            <div class='metric-card' style='border-left: 4px solid {"#10b981" if proc_ready else "#e5e7eb"}; margin-top: 8px;'>
+                <b>📋 Proceedings</b><br>
+                <span style='color: {"#10b981" if proc_ready else "#9ca3af"}; font-size: 0.85rem;'>
+                    {"✅ Ready — go to Invitation tab" if proc_ready else "⏳ Not generated yet"}
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with kit_col3:
+            ach_ready = "achievement_card" in st.session_state
+            st.markdown(f"""
+            <div class='metric-card' style='border-left: 4px solid {"#10b981" if ach_ready else "#e5e7eb"};'>
+                <b>🏆 Achievement</b><br>
+                <span style='color: {"#10b981" if ach_ready else "#9ca3af"}; font-size: 0.85rem;'>
+                    {"✅ Ready — go to Achievements tab" if ach_ready else "⏳ Not generated yet"}
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with kit_col4:
+            # Quick download all button
+            if any(k in st.session_state for k in ["poster", "video_path", "invitation", "proceedings", "achievement_card"]):
+                if st.button("📥 Download All Assets", type="primary", use_container_width=True):
+                    zip_buffer = io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as package:
+                        product_name = st.session_state.get("product_name", "samketan")
+                        full_text = campaign_text(campaign, product_name, st.session_state.get("business_name", ""))
+                        package.writestr(f"{safe_filename(product_name)}_campaign.txt", full_text)
+                        if "poster" in st.session_state:
+                            poster_buffer = io.BytesIO()
+                            st.session_state.poster.save(poster_buffer, format="PNG")
+                            package.writestr(f"{safe_filename(product_name)}_poster.png", poster_buffer.getvalue())
+                        if "video_path" in st.session_state:
+                            with open(st.session_state.video_path, "rb") as handle:
+                                package.writestr(f"{safe_filename(product_name)}_video.mp4", handle.read())
+                        if "invitation" in st.session_state:
+                            invite_buffer = io.BytesIO()
+                            st.session_state.invitation.save(invite_buffer, format="PNG")
+                            package.writestr(f"{safe_filename(product_name)}_invitation.png", invite_buffer.getvalue())
+                        if "proceedings" in st.session_state:
+                            proc_buffer = io.BytesIO()
+                            st.session_state.proceedings.save(proc_buffer, format="PNG")
+                            package.writestr(f"{safe_filename(product_name)}_proceedings.png", proc_buffer.getvalue())
+                        if "achievement_card" in st.session_state:
+                            ach_buffer = io.BytesIO()
+                            st.session_state.achievement_card.save(ach_buffer, format="PNG")
+                            package.writestr(f"{safe_filename(product_name)}_achievement.png", ach_buffer.getvalue())
+                    zip_buffer.seek(0)
+                    st.download_button(
+                        "⬇️ Click to save ZIP",
+                        data=zip_buffer,
+                        file_name=f"{safe_filename(st.session_state.get('product_name', 'samketan'))}_full_kit.zip",
+                        mime="application/zip",
+                    )
+            else:
+                st.markdown("""
+                <div class='metric-card' style='border-left: 4px solid #e5e7eb;'>
+                    <b>📦 Full Package</b><br>
+                    <span style='color: #9ca3af; font-size: 0.85rem;'>Generate assets first</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.divider()
+
         st.subheader("Narration Script")
         st.write(campaign.get("narration_script", ""))
 
@@ -1210,7 +1787,7 @@ with tabs[1]:
 # ─── Tab 2: Video ──────────────────────────────────────────────────────────────
 
 with tabs[2]:
-    st.header("Create Video")
+    st.header("Create Professional Video")
 
     if "campaign" not in st.session_state:
         st.info("Generate a marketing kit first.")
@@ -1219,16 +1796,31 @@ with tabs[2]:
         image = st.session_state.primary_image
         logo = st.session_state.get("logo_image")
 
-        col_a, col_b = st.columns(2)
+        st.subheader("Video Settings")
+        col_a, col_b, col_c = st.columns(3)
         with col_a:
             video_choice = st.selectbox("Video format", list(VIDEO_FORMATS.keys()))
             speed = st.slider("Narration speed", 0.85, 1.25, 1.0, 0.05)
         with col_b:
             accent = st.color_picker("Accent color", "#0f766e")
-            include_tts = st.checkbox("Add Google Cloud narration when service account is available", value=True)
+            include_tts = st.checkbox("Add AI narration", value=True)
+        with col_c:
+            include_music = st.checkbox("Add background music", value=True)
+            music_tempo = st.selectbox("Music tempo", ["slow", "medium", "fast"], 
+                                       help="Slow = calm ambient, Medium = balanced, Fast = energetic")
 
-        if st.button("Generate video", type="primary", use_container_width=True):
-            with st.spinner("Building video..."):
+        st.info("""
+        **What the video includes:**
+        - Multiple scenes from your uploaded photos
+        - Ken Burns effect (slow zoom & pan)
+        - Animated text overlays
+        - Smooth fade transitions
+        - Logo watermark
+        - Background music + AI narration (if enabled)
+        """)
+
+        if st.button("Generate professional video", type="primary", use_container_width=True):
+            with st.spinner("Building professional video with effects..."):
                 try:
                     config = VIDEO_FORMATS[video_choice]
                     audio_path = None
@@ -1236,11 +1828,11 @@ with tabs[2]:
                         try:
                             audio_path = create_tts_audio(campaign["narration_script"], service_account_info, speed)
                             if audio_path:
-                                st.success("Narration audio generated.")
+                                st.success("AI narration generated.")
                             else:
-                                st.warning("No service account found, creating silent video.")
+                                st.warning("No service account found, video will have music only.")
                         except Exception as exc:
-                            st.warning(f"Narration unavailable, creating silent video: {exc}")
+                            st.warning(f"Narration unavailable: {exc}")
 
                     video_path = create_video(
                         image=image,
@@ -1263,10 +1855,7 @@ with tabs[2]:
                     )
                 except Exception as exc:
                     st.error(f"Video generation failed: {exc}")
-                    st.info("Streamlit Cloud needs ffmpeg in packages.txt and moviepy in requirements.txt.")
-
-
-# ─── Tab 3: Poster ─────────────────────────────────────────────────────────────
+                    st.info("Make sure ffmpeg is installed. Streamlit Cloud installs it from packages.txt.")
 
 with tabs[3]:
     st.header("Create Poster")
@@ -1278,34 +1867,62 @@ with tabs[3]:
         image = st.session_state.primary_image
         logo = st.session_state.get("logo_image")
 
+        st.subheader("Poster Design")
         col_a, col_b = st.columns(2)
         with col_a:
             poster_choice = st.selectbox("Poster format", list(POSTER_FORMATS.keys()))
+            st.caption("Choose the platform where you'll post this.")
         with col_b:
-            accent = st.color_picker("Poster accent", "#0f766e")
-            text_color = st.color_picker("Poster text", "#ffffff")
+            accent = st.color_picker("Accent color", "#0f766e", 
+                                     help="Used for highlights and tagline background")
+            text_color = st.color_picker("Text color", "#ffffff",
+                                         help="Main headline color")
+
+        # Show preview info
+        st.info("""
+        **Poster includes:**
+        - Your product photo as background
+        - Logo watermark (if uploaded)
+        - AI-generated headline & tagline
+        - Call-to-action button
+        - Samketan branding
+        """)
 
         if st.button("Generate poster", type="primary", use_container_width=True):
             with st.spinner("Designing poster..."):
                 try:
                     poster = make_poster(image, logo, campaign, POSTER_FORMATS[poster_choice], accent, text_color)
                     st.session_state.poster = poster
-                    st.image(poster, use_container_width=True)
+
+                    # Show poster with download
+                    st.image(poster, use_container_width=True, caption="Your marketing poster")
 
                     poster_buffer = io.BytesIO()
                     poster.save(poster_buffer, format="PNG")
                     poster_buffer.seek(0)
-                    st.download_button(
-                        "Download poster",
-                        data=poster_buffer,
-                        file_name=f"{safe_filename(st.session_state.product_name)}_poster.png",
-                        mime="image/png",
-                    )
+
+                    col_dl1, col_dl2 = st.columns(2)
+                    with col_dl1:
+                        st.download_button(
+                            "📥 Download poster (PNG)",
+                            data=poster_buffer,
+                            file_name=f"{safe_filename(st.session_state.product_name)}_poster.png",
+                            mime="image/png",
+                        )
+                    with col_dl2:
+                        # Also create a JPEG version for smaller file size
+                        poster_buffer_jpg = io.BytesIO()
+                        poster.convert("RGB").save(poster_buffer_jpg, format="JPEG", quality=90)
+                        poster_buffer_jpg.seek(0)
+                        st.download_button(
+                            "📥 Download poster (JPG)",
+                            data=poster_buffer_jpg,
+                            file_name=f"{safe_filename(st.session_state.product_name)}_poster.jpg",
+                            mime="image/jpeg",
+                        )
+
                 except Exception as exc:
                     st.error(f"Poster generation failed: {exc}")
-
-
-# ─── Tab 4: Invitation & Proceedings ──────────────────────────────────────────
 
 with tabs[4]:
     st.header("Event Invitation & Proceedings")
