@@ -1,800 +1,852 @@
 """
-🎬 Samketan AI: Marketing Factory MVP
-Auto-generate videos, posters, and social campaigns in 1 click
+Samketan Marketing Factory
+
+Streamlit app for creating product marketing campaigns from one image:
+campaign copy, social posts, posters, optional video, and optional Drive upload.
 """
+
+import io
+import json
+import os
+import re
+import tempfile
+import zipfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+from urllib.parse import quote
 
 import streamlit as st
-import google.generativeai as genai
-from PIL import Image, ImageDraw, ImageFont
-import os
-import json
-from pathlib import Path
-from datetime import datetime
-import subprocess
-import io
+from google import genai
 from google.oauth2 import service_account
-from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-import tempfile
-import shutil
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
 
-# ============================================================================
-# PAGE CONFIG & STYLING
-# ============================================================================
-st.set_page_config(
-    page_title="Samketan Marketing Factory",
-    page_icon="🎬",
-    layout="wide",
-    initial_sidebar_state="expanded"
+
+APP_NAME = "Samketan Marketing Factory"
+DEFAULT_MODEL = "gemini-3.5-flash"
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
+CATEGORIES = [
+    "Pulses / grains",
+    "Warehouse space",
+    "Grocery",
+    "Spices",
+    "Organic products",
+    "B2B service",
+    "Other",
+]
+
+TARGET_AUDIENCES = [
+    "B2B buyers: wholesalers, supermarkets, distributors",
+    "B2C consumers: families and direct buyers",
+    "Corporate buyers: warehouse and logistics teams",
+    "Retailers and small shops",
+]
+
+VIDEO_FORMATS = {
+    "Instagram Reels / YouTube Shorts - 9:16": {"size": (1080, 1920), "duration": 30},
+    "WhatsApp Status - 9:16": {"size": (1080, 1920), "duration": 20},
+    "Instagram Square - 1:1": {"size": (1080, 1080), "duration": 20},
+    "Facebook Feed - 16:9": {"size": (1280, 720), "duration": 30},
+}
+
+POSTER_FORMATS = {
+    "Instagram Square - 1080x1080": (1080, 1080),
+    "Instagram Story / WhatsApp Status - 1080x1920": (1080, 1920),
+    "Facebook Feed - 1200x628": (1200, 628),
+    "LinkedIn Feed - 1200x1200": (1200, 1200),
+}
+
+
+st.set_page_config(page_title=APP_NAME, layout="wide", initial_sidebar_state="expanded")
+
+st.markdown(
+    """
+    <style>
+        .main .block-container { padding-top: 2rem; max-width: 1180px; }
+        .stButton > button { border-radius: 6px; font-weight: 700; }
+        .metric-card {
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 0.85rem 1rem;
+            background: #ffffff;
+        }
+        .small-muted { color: #6b7280; font-size: 0.9rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-st.markdown("""
-<style>
-    .main { padding: 2rem; }
-    .stTabs [data-baseweb="tab-list"] button { font-size: 1.1rem; }
-    .success-box { background: #d4edda; padding: 1rem; border-radius: 8px; }
-    .info-box { background: #d1ecf1; padding: 1rem; border-radius: 8px; }
-    .warning-box { background: #fff3cd; padding: 1rem; border-radius: 8px; }
-</style>
-""", unsafe_allow_html=True)
 
-st.title("🎬 Samketan Marketing Factory")
-st.caption("Upload photo → Generate video + poster + social campaigns → Share to all platforms")
+def secret_value(name: str, default: Any = None) -> Any:
+    """Read from Streamlit secrets first, then environment variables."""
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.getenv(name, default)
 
-# ============================================================================
-# SIDEBAR: SETTINGS & UPLOAD
-# ============================================================================
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    
-    # API Keys
-    if "GEMINI_API_KEY" in st.secrets:
-        gemini_key = st.secrets["GEMINI_API_KEY"]
-        st.success("✅ Gemini API Key Loaded")
+
+def resolve_model_name(raw_model: Any) -> Tuple[str, str]:
+    model = str(raw_model or DEFAULT_MODEL).strip()
+    if model.startswith("models/"):
+        model = model.split("/", 1)[1]
+
+    if "robotics" in model.lower():
+        return DEFAULT_MODEL, (
+            "Robotics models are not suitable for this marketing app. "
+            f"Using {DEFAULT_MODEL} instead."
+        )
+
+    if not model:
+        return DEFAULT_MODEL, ""
+
+    return model, ""
+
+
+def normalize_mapping(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        return json.loads(value)
+    if hasattr(value, "to_dict"):
+        value = value.to_dict()
     else:
-        gemini_key = st.text_input("Enter Gemini API Key", type="password", key="gemini_input")
-    
-    # Google Drive Setup
-    st.markdown("---")
-    st.subheader("☁️ Google Drive Setup")
-    
-    drive_enabled = False
-    drive_service = None
-    
+        value = dict(value)
+    if "private_key" in value and isinstance(value["private_key"], str):
+        value["private_key"] = value["private_key"].replace("\\n", "\n")
+    return value
+
+
+def get_service_account_info() -> Dict[str, Any]:
     try:
         if "GOOGLE_SERVICE_ACCOUNT" in st.secrets:
-            creds_dict = st.secrets["GOOGLE_SERVICE_ACCOUNT"]
-            credentials = service_account.Credentials.from_service_account_info(creds_dict)
-            drive_service = build('drive', 'v3', credentials=credentials)
-            drive_enabled = True
-            st.success("✅ Google Drive Connected")
+            return normalize_mapping(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
+    except Exception:
+        pass
+
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if raw_json:
+        return normalize_mapping(raw_json)
+
+    return {}
+
+
+def build_drive_service(service_account_info: Dict[str, Any]):
+    if not service_account_info:
+        return None
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=DRIVE_SCOPES,
+    )
+    return build("drive", "v3", credentials=credentials)
+
+
+def prepare_image(image: Image.Image, max_side: int = 1600) -> Image.Image:
+    prepared = ImageOps.exif_transpose(image).convert("RGB")
+    prepared.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    return prepared
+
+
+def build_prompt(product_name: str, category: str, audience: str, details: str) -> str:
+    return f"""
+You are a senior social media marketer for Indian MSME, warehouse, grocery,
+agriculture, and B2B product brands.
+
+Analyze the uploaded product or warehouse image and create a practical campaign
+that can be posted today.
+
+Product name: {product_name}
+Category: {category}
+Target audience: {audience}
+Additional details: {details or "None"}
+
+Return only valid JSON with these exact keys:
+headline, narration_script, poster_main_text, poster_tagline, poster_cta,
+linkedin_post, instagram_caption, facebook_post, whatsapp_message,
+hashtags, image_observations.
+
+Rules:
+- Keep claims believable and do not invent certifications, prices, or stock.
+- Use clear Indian English.
+- Make LinkedIn B2B focused.
+- Make Instagram short, energetic, and hashtag ready.
+- Make WhatsApp direct and sales oriented.
+- Keep poster_main_text under 9 words and poster_cta under 3 words.
+- hashtags must be an array of 8 to 12 strings.
+"""
+
+
+def parse_campaign(raw_text: str) -> Dict[str, Any]:
+    cleaned = raw_text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if match:
+            data = json.loads(match.group(0))
         else:
-            st.info("📌 Paste Google Service Account JSON in Streamlit Secrets to enable auto-upload")
-    except Exception as e:
-        st.warning(f"⚠️ Drive unavailable: {str(e)[:50]}")
-    
-    # Product Upload
-    st.markdown("---")
-    st.subheader("📸 Visual Input")
-    
+            data = {}
+
+    defaults = {
+        "headline": "Fresh quality, ready for your market",
+        "narration_script": raw_text[:900] or "Promote your product with Samketan.",
+        "poster_main_text": "Premium quality",
+        "poster_tagline": "Trusted supply",
+        "poster_cta": "Order now",
+        "linkedin_post": raw_text,
+        "instagram_caption": raw_text,
+        "facebook_post": raw_text,
+        "whatsapp_message": raw_text[:240],
+        "hashtags": ["#Samketan", "#IndianBusiness", "#QualityProducts"],
+        "image_observations": "Generated from the uploaded image.",
+    }
+
+    if not isinstance(data, dict):
+        data = {}
+
+    for key, value in defaults.items():
+        if not data.get(key):
+            data[key] = value
+
+    if isinstance(data["hashtags"], str):
+        data["hashtags"] = [tag.strip() for tag in data["hashtags"].split() if tag.strip()]
+
+    return data
+
+
+def generate_campaign(
+    api_key: str,
+    model_name: str,
+    product_name: str,
+    category: str,
+    audience: str,
+    details: str,
+    image: Image.Image,
+) -> Dict[str, Any]:
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[build_prompt(product_name, category, audience, details), prepare_image(image)],
+    )
+    text = getattr(response, "text", "") or ""
+    if not text:
+        raise RuntimeError("Gemini returned an empty response. Try again with a clearer image.")
+    data = parse_campaign(text)
+    data["_raw"] = text
+    data["_model"] = model_name
+    return data
+
+
+def safe_filename(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
+    return cleaned or "samketan_campaign"
+
+
+def get_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return ImageFont.truetype(candidate, size)
+    return ImageFont.load_default()
+
+
+def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    return right - left, bottom - top
+
+
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> str:
+    words = str(text).split()
+    if not words:
+        return ""
+
+    lines = []
+    current = words[0]
+    for word in words[1:]:
+        test = f"{current} {word}"
+        if text_size(draw, test, font)[0] <= max_width:
+            current = test
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return "\n".join(lines)
+
+
+def draw_centered_multiline(
+    draw: ImageDraw.ImageDraw,
+    xy: Tuple[int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    fill: Tuple[int, int, int],
+    max_width: int,
+    line_gap: int = 10,
+) -> int:
+    wrapped = wrap_text(draw, text, font, max_width)
+    lines = wrapped.splitlines() or [""]
+    x, y = xy
+    total_height = sum(text_size(draw, line, font)[1] for line in lines) + line_gap * (len(lines) - 1)
+    cursor = y - total_height // 2
+    for line in lines:
+        width, height = text_size(draw, line, font)
+        draw.text((x - width // 2, cursor), line, font=font, fill=fill)
+        cursor += height + line_gap
+    return cursor
+
+
+def make_poster(
+    image: Image.Image,
+    campaign: Dict[str, Any],
+    size: Tuple[int, int],
+    accent: str,
+    text_color: str,
+) -> Image.Image:
+    width, height = size
+    base = ImageOps.fit(ImageOps.exif_transpose(image).convert("RGB"), size, method=Image.Resampling.LANCZOS)
+    base = ImageEnhance.Contrast(base).enhance(1.05)
+
+    overlay = Image.new("RGBA", size, (0, 0, 0, 110))
+    poster = Image.alpha_composite(base.convert("RGBA"), overlay)
+    draw = ImageDraw.Draw(poster)
+
+    accent_rgb = tuple(int(accent.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4))
+    text_rgb = tuple(int(text_color.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4))
+
+    margin = max(40, width // 18)
+    title_font = get_font(max(44, width // 12), bold=True)
+    tagline_font = get_font(max(28, width // 28))
+    cta_font = get_font(max(24, width // 32), bold=True)
+    brand_font = get_font(max(20, width // 44), bold=True)
+
+    draw.rounded_rectangle(
+        (margin, margin, margin + max(220, width // 4), margin + 54),
+        radius=8,
+        fill=(255, 255, 255, 225),
+    )
+    draw.text((margin + 20, margin + 16), "SAMKETAN", font=brand_font, fill=(20, 25, 35))
+
+    draw_centered_multiline(
+        draw,
+        (width // 2, height // 2 - height // 12),
+        campaign["poster_main_text"],
+        title_font,
+        text_rgb,
+        width - margin * 2,
+        line_gap=max(8, width // 90),
+    )
+
+    tagline = campaign.get("poster_tagline", "")
+    tag_w, tag_h = text_size(draw, tagline, tagline_font)
+    tag_y = height // 2 + height // 10
+    draw.rounded_rectangle(
+        (
+            width // 2 - tag_w // 2 - 28,
+            tag_y - 14,
+            width // 2 + tag_w // 2 + 28,
+            tag_y + tag_h + 18,
+        ),
+        radius=8,
+        fill=accent_rgb + (230,),
+    )
+    draw.text((width // 2 - tag_w // 2, tag_y), tagline, font=tagline_font, fill=(255, 255, 255))
+
+    cta = campaign.get("poster_cta", "Order now")
+    cta_w, cta_h = text_size(draw, cta, cta_font)
+    cta_y = height - margin - 78
+    draw.rounded_rectangle(
+        (
+            width // 2 - cta_w // 2 - 42,
+            cta_y,
+            width // 2 + cta_w // 2 + 42,
+            cta_y + cta_h + 34,
+        ),
+        radius=8,
+        fill=(255, 255, 255, 238),
+    )
+    draw.text((width // 2 - cta_w // 2, cta_y + 17), cta, font=cta_font, fill=accent_rgb)
+
+    return poster.convert("RGB")
+
+
+def make_video_frame(
+    image: Image.Image,
+    campaign: Dict[str, Any],
+    size: Tuple[int, int],
+    accent: str,
+) -> Image.Image:
+    width, height = size
+    frame = ImageOps.fit(ImageOps.exif_transpose(image).convert("RGB"), size, method=Image.Resampling.LANCZOS)
+    overlay = Image.new("RGBA", size, (0, 0, 0, 70))
+    frame = Image.alpha_composite(frame.convert("RGBA"), overlay)
+    draw = ImageDraw.Draw(frame)
+
+    accent_rgb = tuple(int(accent.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4))
+    title_font = get_font(max(42, width // 16), bold=True)
+    small_font = get_font(max(22, width // 45), bold=True)
+    margin = max(36, width // 22)
+
+    band_height = max(250, height // 5)
+    draw.rectangle((0, height - band_height, width, height), fill=(0, 0, 0, 178))
+    draw.rectangle((0, height - band_height, 12, height), fill=accent_rgb + (255,))
+
+    headline = campaign.get("headline") or campaign.get("poster_main_text") or "Samketan"
+    draw_centered_multiline(
+        draw,
+        (width // 2, height - band_height // 2 - 10),
+        headline,
+        title_font,
+        (255, 255, 255),
+        width - margin * 2,
+        line_gap=8,
+    )
+
+    footer = "Samketan Marketing Factory"
+    footer_w, footer_h = text_size(draw, footer, small_font)
+    draw.rounded_rectangle((margin, margin, margin + footer_w + 30, margin + footer_h + 22), radius=8, fill=(255, 255, 255, 220))
+    draw.text((margin + 15, margin + 11), footer, font=small_font, fill=(20, 25, 35))
+    return frame.convert("RGB")
+
+
+def create_tts_audio(narration: str, service_account_info: Dict[str, Any], speed: float) -> Optional[str]:
+    if not service_account_info:
+        return None
+
+    from google.cloud import texttospeech
+
+    credentials = service_account.Credentials.from_service_account_info(service_account_info)
+    client = texttospeech.TextToSpeechClient(credentials=credentials)
+
+    synthesis_input = texttospeech.SynthesisInput(text=narration[:4500])
+    voice = texttospeech.VoiceSelectionParams(
+        language_code="en-IN",
+        name="en-IN-Neural2-A",
+        ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,
+    )
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3,
+        speaking_rate=float(speed),
+    )
+
+    response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
+    audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    audio_file.write(response.audio_content)
+    audio_file.close()
+    return audio_file.name
+
+
+def create_video(
+    image: Image.Image,
+    campaign: Dict[str, Any],
+    size: Tuple[int, int],
+    duration: int,
+    accent: str,
+    audio_path: Optional[str],
+) -> str:
+    from moviepy.editor import AudioFileClip, ImageClip
+
+    frame = make_video_frame(image, campaign, size, accent)
+    frame_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    frame_path = frame_file.name
+    frame_file.close()
+    frame.save(frame_path)
+
+    clip_duration = duration
+    audio_clip = None
+    if audio_path:
+        audio_clip = AudioFileClip(audio_path)
+        clip_duration = max(4, audio_clip.duration)
+
+    video_clip = ImageClip(frame_path).set_duration(clip_duration)
+    if audio_clip:
+        video_clip = video_clip.set_audio(audio_clip)
+
+    output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    output.close()
+    video_clip.write_videofile(
+        output.name,
+        fps=24,
+        codec="libx264",
+        audio_codec="aac",
+        preset="medium",
+        verbose=False,
+        logger=None,
+    )
+
+    video_clip.close()
+    if audio_clip:
+        audio_clip.close()
+    return output.name
+
+
+def campaign_text(campaign: Dict[str, Any], product_name: str) -> str:
+    hashtags = " ".join(campaign.get("hashtags", []))
+    return f"""Campaign: {product_name}
+Model: {campaign.get("_model", DEFAULT_MODEL)}
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+Headline:
+{campaign.get("headline", "")}
+
+Narration Script:
+{campaign.get("narration_script", "")}
+
+Poster:
+Main text: {campaign.get("poster_main_text", "")}
+Tagline: {campaign.get("poster_tagline", "")}
+CTA: {campaign.get("poster_cta", "")}
+
+LinkedIn:
+{campaign.get("linkedin_post", "")}
+
+Instagram:
+{campaign.get("instagram_caption", "")}
+
+Facebook:
+{campaign.get("facebook_post", "")}
+
+WhatsApp:
+{campaign.get("whatsapp_message", "")}
+
+Hashtags:
+{hashtags}
+
+Image observations:
+{campaign.get("image_observations", "")}
+"""
+
+
+def upload_text_file(drive_service, folder_id: str, name: str, text: str) -> None:
+    temp = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt", encoding="utf-8")
+    temp.write(text)
+    temp.close()
+    metadata = {"name": name, "parents": [folder_id]}
+    media = MediaFileUpload(temp.name, mimetype="text/plain")
+    drive_service.files().create(body=metadata, media_body=media, fields="id").execute()
+
+
+def upload_binary_file(drive_service, folder_id: str, name: str, path: str, mimetype: str) -> None:
+    metadata = {"name": name, "parents": [folder_id]}
+    media = MediaFileUpload(path, mimetype=mimetype)
+    drive_service.files().create(body=metadata, media_body=media, fields="id").execute()
+
+
+def social_text_area(label: str, value: str, height: int = 170) -> None:
+    st.text_area(label, value=value, height=height, disabled=True)
+
+
+gemini_key = secret_value("GEMINI_API_KEY", "")
+model_name, model_warning = resolve_model_name(secret_value("GEMINI_MODEL", DEFAULT_MODEL))
+service_account_info = get_service_account_info()
+
+try:
+    drive_service = build_drive_service(service_account_info)
+    drive_error = ""
+except Exception as exc:
+    drive_service = None
+    drive_error = str(exc)
+
+
+with st.sidebar:
+    st.header("Configuration")
+
+    if gemini_key:
+        st.success("Gemini API key loaded")
+    else:
+        gemini_key = st.text_input("Gemini API key", type="password")
+
+    requested_model = st.text_input("Gemini model", value=model_name, help="Default: gemini-3.5-flash")
+    model_name, sidebar_model_warning = resolve_model_name(requested_model)
+    if model_warning or sidebar_model_warning:
+        st.warning(model_warning or sidebar_model_warning)
+    st.caption("Avoid robotics preview models for marketing copy. Use a stable Gemini text/vision model.")
+
+    st.divider()
+    st.subheader("Google services")
+    if drive_service:
+        st.success("Google Drive upload ready")
+        st.caption("The same service account can be used for Google Cloud Text-to-Speech.")
+    elif drive_error:
+        st.warning(f"Google service setup failed: {drive_error[:140]}")
+    else:
+        st.info("Add GOOGLE_SERVICE_ACCOUNT in Streamlit Secrets for Drive upload and narration.")
+
+    st.divider()
+    st.subheader("Image")
     uploaded_file = st.file_uploader(
-        "Upload Product/Warehouse Photo",
-        type=["jpg", "jpeg", "png"],
-        help="Use high-quality images for best results"
+        "Upload product or warehouse photo",
+        type=["jpg", "jpeg", "png", "webp"],
+        help="Use a clear, well-lit image for best output.",
     )
-    
-    image = None
-    image_path = None
-    
-    if uploaded_file is not None:
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Product Preview", use_container_width=True)
-        
-        # Save temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-            image.save(tmp.name)
-            image_path = tmp.name
+
+    uploaded_image = None
+    if uploaded_file:
+        uploaded_image = Image.open(uploaded_file)
+        st.image(uploaded_image, caption="Preview", use_container_width=True)
 
 
-# ============================================================================
-# MAIN INTERFACE: TABS
-# ============================================================================
+st.title(APP_NAME)
+st.caption("Upload one image, generate ready-to-post campaigns for LinkedIn, Instagram, Facebook, and WhatsApp.")
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🎬 Campaign Generator",
-    "📹 Video Composer",
-    "🎨 Poster Designer",
-    "📤 Social Sharing"
-])
+tabs = st.tabs(["Campaign", "Video", "Poster", "Social and Drive"])
 
-# ============================================================================
-# TAB 1: CAMPAIGN GENERATOR
-# ============================================================================
-with tab1:
-    st.header("Step 1: Define Your Campaign")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        product_name = st.text_input(
-            "Product Name",
-            placeholder="e.g., Premium Toor Dal from Kalaburagi",
-            key="product_name"
-        )
-    
-    with col2:
-        product_category = st.selectbox(
-            "Product Category",
-            ["Pulses/Grains", "Warehouse Space", "Grocery", "Spices", "Organic", "Other"],
-            key="category"
-        )
-    
-    target_audience = st.selectbox(
-        "Target Audience",
-        [
-            "B2B (Wholesalers, Supermarkets)",
-            "B2C (Direct Consumers)",
-            "Corporate (For Warehouse Space)",
-            "Retailers & Small Shops"
-        ],
-        key="audience"
+with tabs[0]:
+    st.header("Create Campaign")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        product_name = st.text_input("Product name", placeholder="Example: Premium Toor Dal from Kalaburagi")
+        category = st.selectbox("Product category", CATEGORIES)
+    with col_b:
+        audience = st.selectbox("Target audience", TARGET_AUDIENCES)
+        tone = st.selectbox("Campaign tone", ["Trust-building", "Premium", "Festival sale", "Bulk order", "Local brand"])
+
+    details = st.text_area(
+        "Extra details",
+        placeholder="Add quality points, location, offer, minimum order, delivery area, phone number, or website.",
+        height=110,
     )
-    
-    additional_details = st.text_area(
-        "Additional Details (Optional)",
-        placeholder="e.g., Organic certification, bulk discounts, fast delivery...",
-        key="details"
-    )
-    
-    if st.button("🚀 Generate Full Campaign", type="primary", use_container_width=True):
+
+    if tone and tone not in details:
+        details_for_prompt = f"{details}\nPreferred tone: {tone}".strip()
+    else:
+        details_for_prompt = details
+
+    can_generate = bool(gemini_key and uploaded_image and product_name)
+    if st.button("Generate marketing campaign", type="primary", use_container_width=True, disabled=not can_generate):
+        with st.spinner("Generating campaign with Gemini..."):
+            try:
+                campaign = generate_campaign(
+                    api_key=gemini_key,
+                    model_name=model_name,
+                    product_name=product_name,
+                    category=category,
+                    audience=audience,
+                    details=details_for_prompt,
+                    image=uploaded_image,
+                )
+                st.session_state.campaign = campaign
+                st.session_state.product_name = product_name
+                st.session_state.uploaded_image = uploaded_image.copy()
+                st.success("Campaign generated.")
+            except Exception as exc:
+                st.error(f"Campaign generation failed: {exc}")
+                st.info("Use a current model such as gemini-3.5-flash and confirm your GEMINI_API_KEY is valid.")
+
+    if not can_generate:
+        missing = []
         if not gemini_key:
-            st.error("❌ Please enter Gemini API Key")
-        elif not image:
-            st.error("❌ Please upload a product photo")
-        elif not product_name:
-            st.error("❌ Please enter product name")
-        else:
-            with st.spinner("🤖 Creative Director analyzing image..."):
-                try:
-                    genai.configure(api_key=gemini_key)
-                    
-                    # Find best available vision model
-                    active_model = "gemini-1.5-flash-latest"
-                    try:
-                        for m in genai.list_models():
-                            if 'generateContent' in m.supported_generation_methods and ('1.5' in m.name or 'vision' in m.name):
-                                active_model = m.name
-                                break
-                    except:
-                        pass
-                    
-                    model = genai.GenerativeModel(active_model)
-                    
-                    prompt = f"""
-You are an expert Social Media Manager, Creative Director, and Marketing Strategist.
+            missing.append("Gemini API key")
+        if not uploaded_image:
+            missing.append("product image")
+        if not product_name:
+            missing.append("product name")
+        st.info("Add " + ", ".join(missing) + " to generate a campaign.")
 
-Analyze this product image carefully. Your job is to create a complete marketing campaign package.
+    if "campaign" in st.session_state:
+        campaign = st.session_state.campaign
+        st.subheader(campaign.get("headline", "Campaign"))
+        st.write(campaign.get("image_observations", ""))
 
-**PRODUCT DETAILS:**
-- Product Name: {product_name}
-- Category: {product_category}
-- Target Audience: {target_audience}
-- Additional Info: {additional_details if additional_details else "None provided"}
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f"<div class='metric-card'><b>Model</b><br>{campaign.get('_model', model_name)}</div>", unsafe_allow_html=True)
+        c2.markdown(f"<div class='metric-card'><b>Poster CTA</b><br>{campaign.get('poster_cta', '')}</div>", unsafe_allow_html=True)
+        c3.markdown(f"<div class='metric-card'><b>Hashtags</b><br>{len(campaign.get('hashtags', []))}</div>", unsafe_allow_html=True)
 
-**CREATE A COMPLETE MARKETING CAMPAIGN WITH THESE EXACT SECTIONS:**
+        st.subheader("Narration Script")
+        st.write(campaign.get("narration_script", ""))
 
----
+with tabs[1]:
+    st.header("Create Video")
 
-### 📌 CAMPAIGN HEADLINE
-[One powerful headline that sells the product in 10 words max]
-
----
-
-### 🎬 NARRATION SCRIPT (For Video)
-[60-90 seconds of engaging narration for a video. Make it exciting, conversational, benefit-focused]
-[Start with a hook, explain 3 key benefits, end with CTA]
-[Write as if being spoken aloud - natural, energetic tone]
-
----
-
-### 🎨 POSTER DESIGN BRIEF
-**Background Color:** [Suggest primary color]
-**Typography Style:** [Modern/Classic/Bold/Elegant]
-**Main Text:** [Headline for poster - max 3 lines]
-**Tagline:** [2-word catchy phrase]
-**Call to Action:** [Button text - max 3 words]
-
----
-
-### 📱 LINKEDIN POST
-[Professional, B2B-focused post with business value emphasis]
-[Include supply chain, quality, or batch ordering benefits]
-[2-3 relevant hashtags max]
-
----
-
-### 📸 INSTAGRAM REELS CAPTION
-[Catchy, emoji-rich, highly engaging 1-2 lines]
-[Viral hashtags: 8-10 trending ones for this category]
-
----
-
-### 👍 FACEBOOK POST
-[Conversational, community-focused post]
-[Emphasis on local/trusted brand]
-[3-5 relevant hashtags]
-
----
-
-### 💬 WHATSAPP BROADCAST MESSAGE
-[Short, direct, urgency-driven message]
-[Max 2 sentences + clear CTA button text]
-
----
-
-**IMPORTANT:** Be specific to the product shown. Make it compelling, authentic, and ready-to-publish immediately.
-"""
-                    
-                    response = model.generate_content([prompt, image])
-                    
-                    # Store campaign in session state
-                    st.session_state.campaign_content = response.text
-                    st.session_state.product_name = product_name
-                    st.session_state.product_category = product_category
-                    st.session_state.image = image
-                    st.session_state.image_path = image_path
-                    st.session_state.gemini_key = gemini_key
-                    st.session_state.drive_service = drive_service
-                    st.session_state.drive_enabled = drive_enabled
-                    
-                    st.success("✅ Campaign Generated Successfully!")
-                    st.markdown(response.text)
-                    
-                except Exception as e:
-                    st.error(f"❌ Error: {str(e)}")
-
-
-# ============================================================================
-# TAB 2: VIDEO COMPOSER
-# ============================================================================
-with tab2:
-    st.header("Step 2: Generate Video with AI Narration")
-    
-    if "campaign_content" not in st.session_state:
-        st.info("👈 Please generate a campaign first (Tab 1)")
+    if "campaign" not in st.session_state:
+        st.info("Generate a campaign first.")
     else:
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.subheader("Video Settings")
-            
-            video_format = st.selectbox(
-                "Select Video Format",
-                {
-                    "Instagram Reels (9:16)": {"res": (1080, 1920), "duration": 30},
-                    "YouTube Short (9:16)": {"res": (1080, 1920), "duration": 60},
-                    "Facebook Feed (16:9)": {"res": (1280, 720), "duration": 30},
-                    "WhatsApp (1:1)": {"res": (1080, 1080), "duration": 15}
-                },
-                format_func=lambda x: x
-            )
-            
-            video_speed = st.slider("Narration Speed", 0.8, 1.5, 1.0, step=0.1)
-            background_music = st.checkbox("Add Royalty-Free Background Music", value=False)
-        
-        with col2:
-            st.subheader("Preview Settings")
-            show_captions = st.checkbox("Add Captions to Video", value=True)
-            caption_color = st.color_picker("Caption Color", "#FFFFFF")
-        
-        if st.button("🎬 Generate Video", type="primary", use_container_width=True):
-            st.warning("⏳ Video generation in progress (2-3 minutes)...")
-            
-            with st.spinner("🎙️ Generating AI narration..."):
+        campaign = st.session_state.campaign
+        image = st.session_state.uploaded_image
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            video_choice = st.selectbox("Video format", list(VIDEO_FORMATS.keys()))
+            speed = st.slider("Narration speed", 0.85, 1.25, 1.0, 0.05)
+        with col_b:
+            accent = st.color_picker("Accent color", "#0f766e")
+            include_tts = st.checkbox("Add Google Cloud narration when service account is available", value=True)
+
+        if st.button("Generate video", type="primary", use_container_width=True):
+            with st.spinner("Building video..."):
                 try:
-                    # Extract narration script from campaign
-                    campaign = st.session_state.campaign_content
-                    
-                    # Parse narration from campaign
-                    if "NARRATION SCRIPT" in campaign:
-                        narration_start = campaign.find("NARRATION SCRIPT") + len("NARRATION SCRIPT")
-                        narration_end = campaign.find("---", narration_start)
-                        narration = campaign[narration_start:narration_end].strip()
-                    else:
-                        narration = "Check out our amazing product!"
-                    
-                    st.info(f"📝 Narration: {narration[:100]}...")
-                    
-                    # Step 1: Generate audio using Google Cloud TTS (free tier)
-                    try:
-                        from google.cloud import texttospeech
-                        
-                        tts_client = texttospeech.TextToSpeechClient(
-                            credentials=service_account.Credentials.from_service_account_info(
-                                st.secrets.get("GOOGLE_SERVICE_ACCOUNT", {})
-                            )
-                        )
-                        
-                        synthesis_input = texttospeech.SynthesisInput(text=narration)
-                        voice = texttospeech.VoiceSelectionParams(
-                            language_code="en-IN",
-                            name="en-IN-Neural2-A",
-                            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
-                        )
-                        audio_config = texttospeech.AudioConfig(
-                            audio_encoding=texttospeech.AudioEncoding.MP3,
-                            speaking_rate=video_speed
-                        )
-                        
-                        response = tts_client.synthesize_speech(
-                            input=synthesis_input,
-                            voice=voice,
-                            audio_config=audio_config
-                        )
-                        
-                        audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-                        audio_file.write(response.audio_content)
-                        audio_file.close()
-                        audio_path = audio_file.name
-                        
-                        st.success("✅ Narration generated (English - India accent)")
-                    
-                    except:
-                        # Fallback: Use pyttsx3 for offline TTS
-                        st.info("📌 Using offline text-to-speech (pyttsx3)")
-                        import pyttsx3
-                        
-                        engine = pyttsx3.init()
-                        engine.setProperty('rate', int(150 * video_speed))
-                        
-                        audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-                        audio_path = audio_file.name
-                        audio_file.close()
-                        
-                        engine.save_to_file(narration, audio_path)
-                        engine.runAndWait()
-                        
-                        st.success("✅ Narration generated (offline)")
-                    
-                    # Step 2: Generate video using MoviePy
-                    with st.spinner("🎬 Composing video..."):
+                    config = VIDEO_FORMATS[video_choice]
+                    audio_path = None
+                    if include_tts:
                         try:
-                            from moviepy.editor import (
-                                ImageClip, AudioFileClip, CompositeVideoClip,
-                                TextClip, ColorClip, concatenate_videoclips
-                            )
-                            from moviepy.video.fx.resize import resize
-                            
-                            format_config = video_format.split("(")[1].rstrip(")")
-                            width, height = video_format["res"]
-                            
-                            # Load image and audio
-                            image_clip = ImageClip(st.session_state.image_path)
-                            image_clip = resize(image_clip, width=width, height=height)
-                            
-                            audio_clip = AudioFileClip(audio_path)
-                            duration = audio_clip.duration
-                            
-                            image_clip = image_clip.set_duration(duration)
-                            
-                            # Add captions if enabled
-                            if show_captions:
-                                headline = st.session_state.campaign_content.split("CAMPAIGN HEADLINE")[1].split("---")[0].strip()[:60]
-                                
-                                txt_clip = TextClip(
-                                    headline,
-                                    fontsize=50,
-                                    color=caption_color.lstrip("#"),
-                                    font="Arial-Bold",
-                                    method="caption",
-                                    size=(width - 100, None)
-                                )
-                                txt_clip = txt_clip.set_duration(duration)
-                                txt_clip = txt_clip.set_position(("center", "bottom"))
-                                
-                                final_clip = CompositeVideoClip([image_clip, txt_clip])
+                            audio_path = create_tts_audio(campaign["narration_script"], service_account_info, speed)
+                            if audio_path:
+                                st.success("Narration audio generated.")
                             else:
-                                final_clip = image_clip
-                            
-                            # Add audio
-                            final_clip = final_clip.set_audio(audio_clip)
-                            
-                            # Save video
-                            video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                            video_path.close()
-                            
-                            final_clip.write_videofile(
-                                video_path.name,
-                                fps=24,
-                                codec='libx264',
-                                audio_codec='aac',
-                                verbose=False,
-                                logger=None
-                            )
-                            
-                            st.session_state.video_path = video_path.name
-                            st.success("✅ Video generated successfully!")
-                            
-                            # Display video
-                            with open(video_path.name, "rb") as f:
-                                video_bytes = f.read()
-                            
-                            st.video(video_bytes)
-                            
-                            # Download button
-                            st.download_button(
-                                label="⬇️ Download Video",
-                                data=video_bytes,
-                                file_name=f"{st.session_state.product_name}_video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4",
-                                mime="video/mp4"
-                            )
-                        
-                        except Exception as e:
-                            st.error(f"❌ Video generation error: {str(e)}")
-                            st.info("💡 Ensure ffmpeg is installed: `pip install moviepy imageio`")
-                
-                except Exception as e:
-                    st.error(f"❌ Error: {str(e)}")
+                                st.warning("No service account found, so a silent video will be created.")
+                        except Exception as exc:
+                            st.warning(f"Narration unavailable, creating silent video: {exc}")
 
-
-# ============================================================================
-# TAB 3: POSTER DESIGNER
-# ============================================================================
-with tab3:
-    st.header("Step 3: AI-Designed Poster")
-    
-    if "campaign_content" not in st.session_state:
-        st.info("👈 Please generate a campaign first (Tab 1)")
-    else:
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.subheader("Poster Settings")
-            
-            poster_format = st.selectbox(
-                "Select Poster Format",
-                {
-                    "Instagram Square (1080x1080)": (1080, 1080),
-                    "Instagram Story (1080x1920)": (1080, 1920),
-                    "Facebook (1200x628)": (1200, 628),
-                    "WhatsApp Status (1080x1920)": (1080, 1920),
-                    "Custom": None
-                },
-                format_func=lambda x: x
-            )
-            
-            if poster_format == "Custom":
-                w, h = st.columns(2)
-                with w:
-                    custom_width = st.number_input("Width", 800, 2000, 1080)
-                with h:
-                    custom_height = st.number_input("Height", 600, 2000, 1080)
-                poster_format = (custom_width, custom_height)
-        
-        with col2:
-            st.subheader("Design Settings")
-            bg_color = st.color_picker("Background Color", "#003366")
-            text_color = st.color_picker("Text Color", "#FFFFFF")
-        
-        if st.button("🎨 Generate Poster", type="primary", use_container_width=True):
-            with st.spinner("🎨 Designing poster..."):
-                try:
-                    from PIL import ImageFilter, ImageEnhance
-                    
-                    campaign = st.session_state.campaign_content
-                    
-                    # Extract design brief
-                    if "POSTER DESIGN BRIEF" in campaign:
-                        brief_start = campaign.find("POSTER DESIGN BRIEF") + len("POSTER DESIGN BRIEF")
-                        brief_end = campaign.find("---", brief_start)
-                        design_brief = campaign[brief_start:brief_end].strip()
-                    else:
-                        design_brief = "Amazing Product!"
-                    
-                    # Parse design elements
-                    lines = [l.strip() for l in design_brief.split("\n") if l.strip()]
-                    main_text = st.session_state.product_name
-                    tagline = "Premium Quality | Best Price"
-                    cta = "Order Now"
-                    
-                    for line in lines:
-                        if "Main Text:" in line:
-                            main_text = line.split("Main Text:")[-1].strip()
-                        elif "Tagline:" in line:
-                            tagline = line.split("Tagline:")[-1].strip()
-                        elif "Call to Action:" in line:
-                            cta = line.split("Call to Action:")[-1].strip()
-                    
-                    # Create poster
-                    width, height = poster_format
-                    
-                    # Load and resize image as background
-                    bg_image = st.session_state.image.copy()
-                    bg_image = bg_image.resize((width, height), Image.Resampling.LANCZOS)
-                    
-                    # Create semi-transparent overlay
-                    overlay = Image.new('RGBA', (width, height), (0, 0, 0, 180))
-                    bg_image.paste(overlay, (0, 0), overlay)
-                    
-                    # Add text
-                    draw = ImageDraw.Draw(bg_image)
-                    
-                    # Estimate font sizes
-                    title_size = max(30, int(width / 15))
-                    tagline_size = max(20, int(width / 25))
-                    cta_size = max(18, int(width / 28))
-                    
-                    try:
-                        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", title_size)
-                        tagline_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", tagline_size)
-                        cta_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", cta_size)
-                    except:
-                        title_font = ImageFont.load_default()
-                        tagline_font = ImageFont.load_default()
-                        cta_font = ImageFont.load_default()
-                    
-                    # Draw main text
-                    title_color = tuple(int(text_color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)) + (255,)
-                    y_position = height // 3
-                    
-                    draw.text((width // 2, y_position), main_text, fill=title_color, font=title_font, anchor="mm", align="center")
-                    
-                    # Draw tagline
-                    y_position += title_size + 20
-                    draw.text((width // 2, y_position), tagline, fill=title_color, font=tagline_font, anchor="mm", align="center")
-                    
-                    # Draw CTA button
-                    y_position = height - 80
-                    button_width = 200
-                    button_height = 50
-                    button_x = (width - button_width) // 2
-                    button_y = y_position - button_height // 2
-                    
-                    # Draw button background
-                    draw.rectangle(
-                        [(button_x, button_y), (button_x + button_width, button_y + button_height)],
-                        fill=tuple(int(text_color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+                    video_path = create_video(
+                        image=image,
+                        campaign=campaign,
+                        size=config["size"],
+                        duration=config["duration"],
+                        accent=accent,
+                        audio_path=audio_path,
                     )
-                    
-                    # Draw button text
-                    draw.text(
-                        (width // 2, button_y + button_height // 2),
-                        cta,
-                        fill=(0, 0, 0, 255),
-                        font=cta_font,
-                        anchor="mm",
-                        align="center"
-                    )
-                    
-                    st.session_state.poster = bg_image
-                    
-                    st.success("✅ Poster generated!")
-                    st.image(bg_image, use_container_width=True)
-                    
-                    # Download button
-                    poster_bytes = io.BytesIO()
-                    bg_image.save(poster_bytes, format="PNG")
-                    poster_bytes.seek(0)
-                    
+                    st.session_state.video_path = video_path
+                    with open(video_path, "rb") as handle:
+                        video_bytes = handle.read()
+                    st.video(video_bytes)
                     st.download_button(
-                        label="⬇️ Download Poster",
-                        data=poster_bytes,
-                        file_name=f"{st.session_state.product_name}_poster_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                        mime="image/png"
+                        "Download video",
+                        data=video_bytes,
+                        file_name=f"{safe_filename(st.session_state.product_name)}_video.mp4",
+                        mime="video/mp4",
                     )
-                
-                except Exception as e:
-                    st.error(f"❌ Error: {str(e)}")
+                except Exception as exc:
+                    st.error(f"Video generation failed: {exc}")
+                    st.info("Streamlit Cloud needs ffmpeg in packages.txt and moviepy in requirements.txt.")
 
+with tabs[2]:
+    st.header("Create Poster")
 
-# ============================================================================
-# TAB 4: SOCIAL SHARING
-# ============================================================================
-with tab4:
-    st.header("Step 4: Share to Social Media")
-    
-    if "campaign_content" not in st.session_state:
-        st.info("👈 Please generate a campaign first (Tab 1)")
+    if "campaign" not in st.session_state:
+        st.info("Generate a campaign first.")
     else:
-        st.subheader("📤 Share Your Campaign")
-        
-        # Extract social content from campaign
-        campaign = st.session_state.campaign_content
-        
-        linkedin_post = ""
-        instagram_caption = ""
-        facebook_post = ""
-        whatsapp_message = ""
-        
-        if "LINKEDIN POST" in campaign:
-            linkedin_start = campaign.find("LINKEDIN POST") + len("LINKEDIN POST")
-            linkedin_end = campaign.find("---", linkedin_start)
-            linkedin_post = campaign[linkedin_start:linkedin_end].strip()
-        
-        if "INSTAGRAM REELS CAPTION" in campaign:
-            instagram_start = campaign.find("INSTAGRAM REELS CAPTION") + len("INSTAGRAM REELS CAPTION")
-            instagram_end = campaign.find("---", instagram_start)
-            instagram_caption = campaign[instagram_start:instagram_end].strip()
-        
-        if "FACEBOOK POST" in campaign:
-            facebook_start = campaign.find("FACEBOOK POST") + len("FACEBOOK POST")
-            facebook_end = campaign.find("---", facebook_start)
-            facebook_post = campaign[facebook_start:facebook_end].strip()
-        
-        if "WHATSAPP BROADCAST MESSAGE" in campaign:
-            whatsapp_start = campaign.find("WHATSAPP BROADCAST MESSAGE") + len("WHATSAPP BROADCAST MESSAGE")
-            whatsapp_end = campaign.find("---", whatsapp_start)
-            whatsapp_message = campaign[whatsapp_start:whatsapp_end].strip()
-        
-        # Social Media Options
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("🔗 LinkedIn")
-            st.text_area("LinkedIn Post", value=linkedin_post, height=150, key="linkedin_textarea", disabled=True)
-            
-            linkedin_url = f"https://www.linkedin.com/feed/?feedUpdate=urn%3Ali%3AactivityId%3A0"
-            st.markdown(f"[✏️ Edit & Post on LinkedIn]({linkedin_url})", unsafe_allow_html=True)
-            
-            st.info("Steps:\n1. Click link above\n2. Copy-paste the text\n3. Add video/image\n4. Post!")
-        
-        with col2:
-            st.subheader("📸 Instagram Reels")
-            st.text_area("Instagram Caption", value=instagram_caption, height=150, key="instagram_textarea", disabled=True)
-            
-            instagram_url = "https://www.instagram.com/"
-            st.markdown(f"[📱 Post on Instagram]({instagram_url})", unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        col3, col4 = st.columns(2)
-        
-        with col3:
-            st.subheader("👍 Facebook")
-            st.text_area("Facebook Post", value=facebook_post, height=150, key="facebook_textarea", disabled=True)
-            
-            facebook_url = "https://www.facebook.com/"
-            st.markdown(f"[📘 Post on Facebook]({facebook_url})", unsafe_allow_html=True)
-        
-        with col4:
-            st.subheader("💬 WhatsApp")
-            st.text_area("WhatsApp Message", value=whatsapp_message, height=150, key="whatsapp_textarea", disabled=True)
-            
-            whatsapp_url = f"https://wa.me/?text={whatsapp_message.replace(' ', '%20')}"
-            st.markdown(f"[💬 Send on WhatsApp]({whatsapp_url})", unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        # Google Drive Upload
-        if st.session_state.drive_enabled:
-            st.subheader("☁️ Save to Google Drive")
-            
-            folder_name = st.text_input("Campaign Folder Name", value=f"{st.session_state.product_name}_{datetime.now().strftime('%Y%m%d')}")
-            
-            if st.button("📁 Upload to Google Drive", type="primary", use_container_width=True):
-                with st.spinner("Uploading files..."):
-                    try:
-                        # Create folder
-                        folder_metadata = {'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder'}
-                        folder = st.session_state.drive_service.files().create(body=folder_metadata, fields='id').execute()
-                        folder_id = folder.get('id')
-                        
-                        uploaded_files = []
-                        
-                        # Upload poster
-                        if "poster" in st.session_state:
-                            poster_bytes = io.BytesIO()
-                            st.session_state.poster.save(poster_bytes, format="PNG")
-                            poster_bytes.seek(0)
-                            
-                            poster_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-                            poster_temp.write(poster_bytes.getvalue())
-                            poster_temp.close()
-                            
-                            file_metadata = {'name': f'{folder_name}_poster.png', 'parents': [folder_id]}
-                            media = MediaFileUpload(poster_temp.name, mimetype='image/png')
-                            st.session_state.drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-                            uploaded_files.append("Poster")
-                        
-                        # Upload video
-                        if "video_path" in st.session_state:
-                            file_metadata = {'name': f'{folder_name}_video.mp4', 'parents': [folder_id]}
-                            media = MediaFileUpload(st.session_state.video_path, mimetype='video/mp4')
-                            st.session_state.drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-                            uploaded_files.append("Video")
-                        
-                        # Upload campaign text
-                        campaign_text = f"""
-CAMPAIGN: {st.session_state.product_name}
-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        campaign = st.session_state.campaign
+        image = st.session_state.uploaded_image
 
-{campaign}
-"""
-                        campaign_temp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".txt")
-                        campaign_temp.write(campaign_text)
-                        campaign_temp.close()
-                        
-                        file_metadata = {'name': f'{folder_name}_campaign.txt', 'parents': [folder_id]}
-                        media = MediaFileUpload(campaign_temp.name, mimetype='text/plain')
-                        st.session_state.drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-                        uploaded_files.append("Campaign Brief")
-                        
-                        st.success(f"✅ Uploaded to Google Drive: {', '.join(uploaded_files)}")
-                        st.markdown(f"📁 [Open Folder in Google Drive](https://drive.google.com/drive/folders/{folder_id})")
-                    
-                    except Exception as e:
-                        st.error(f"❌ Upload failed: {str(e)}")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            poster_choice = st.selectbox("Poster format", list(POSTER_FORMATS.keys()))
+        with col_b:
+            accent = st.color_picker("Poster accent", "#0f766e")
+            text_color = st.color_picker("Poster text", "#ffffff")
+
+        if st.button("Generate poster", type="primary", use_container_width=True):
+            with st.spinner("Designing poster..."):
+                try:
+                    poster = make_poster(image, campaign, POSTER_FORMATS[poster_choice], accent, text_color)
+                    st.session_state.poster = poster
+                    st.image(poster, use_container_width=True)
+
+                    poster_buffer = io.BytesIO()
+                    poster.save(poster_buffer, format="PNG")
+                    poster_buffer.seek(0)
+                    st.download_button(
+                        "Download poster",
+                        data=poster_buffer,
+                        file_name=f"{safe_filename(st.session_state.product_name)}_poster.png",
+                        mime="image/png",
+                    )
+                except Exception as exc:
+                    st.error(f"Poster generation failed: {exc}")
+
+with tabs[3]:
+    st.header("Social Copy and Drive")
+
+    if "campaign" not in st.session_state:
+        st.info("Generate a campaign first.")
+    else:
+        campaign = st.session_state.campaign
+        product_name = st.session_state.product_name
+        full_text = campaign_text(campaign, product_name)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            social_text_area("LinkedIn", campaign.get("linkedin_post", ""))
+            linkedin_url = "https://www.linkedin.com/feed/"
+            st.link_button("Open LinkedIn", linkedin_url)
+        with col_b:
+            instagram_caption = campaign.get("instagram_caption", "")
+            hashtags = " ".join(campaign.get("hashtags", []))
+            social_text_area("Instagram", f"{instagram_caption}\n\n{hashtags}")
+            st.link_button("Open Instagram", "https://www.instagram.com/")
+
+        col_c, col_d = st.columns(2)
+        with col_c:
+            social_text_area("Facebook", campaign.get("facebook_post", ""))
+            st.link_button("Open Facebook", "https://www.facebook.com/")
+        with col_d:
+            whatsapp_message = campaign.get("whatsapp_message", "")
+            social_text_area("WhatsApp", whatsapp_message)
+            st.link_button("Open WhatsApp", f"https://wa.me/?text={quote(whatsapp_message)}")
+
+        st.download_button(
+            "Download campaign text",
+            data=full_text.encode("utf-8"),
+            file_name=f"{safe_filename(product_name)}_campaign.txt",
+            mime="text/plain",
+        )
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as package:
+            package.writestr(f"{safe_filename(product_name)}_campaign.txt", full_text)
+            if "poster" in st.session_state:
+                poster_buffer = io.BytesIO()
+                st.session_state.poster.save(poster_buffer, format="PNG")
+                package.writestr(f"{safe_filename(product_name)}_poster.png", poster_buffer.getvalue())
+            if "video_path" in st.session_state:
+                with open(st.session_state.video_path, "rb") as handle:
+                    package.writestr(f"{safe_filename(product_name)}_video.mp4", handle.read())
+        zip_buffer.seek(0)
+
+        st.download_button(
+            "Download full package",
+            data=zip_buffer,
+            file_name=f"{safe_filename(product_name)}_package.zip",
+            mime="application/zip",
+            type="primary",
+        )
+
+        st.divider()
+        st.subheader("Upload to Google Drive")
+
+        if not drive_service:
+            st.info("Add GOOGLE_SERVICE_ACCOUNT to Streamlit Secrets to enable Drive upload.")
         else:
-            st.warning("⚠️ Google Drive not connected. Set up Google Service Account in Streamlit Secrets to enable auto-upload.")
-        
-        # Download All
-        st.markdown("---")
-        st.subheader("📦 Download Package")
-        
-        if st.button("📥 Download All Files (ZIP)", type="primary", use_container_width=True):
-            import zipfile
-            
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-                # Add campaign text
-                campaign_text = st.session_state.campaign_content
-                zf.writestr(f"{st.session_state.product_name}_campaign.txt", campaign_text)
-                
-                # Add social posts
-                social_posts = f"""
-LINKEDIN:
-{linkedin_post}
+            folder_name = st.text_input("Drive folder name", value=f"{safe_filename(product_name)}_{datetime.now().strftime('%Y%m%d')}")
+            if st.button("Upload campaign package to Drive", use_container_width=True):
+                with st.spinner("Uploading to Google Drive..."):
+                    try:
+                        folder_metadata = {
+                            "name": folder_name,
+                            "mimeType": "application/vnd.google-apps.folder",
+                        }
+                        folder = drive_service.files().create(body=folder_metadata, fields="id").execute()
+                        folder_id = folder["id"]
 
----
+                        upload_text_file(drive_service, folder_id, f"{folder_name}_campaign.txt", full_text)
 
-INSTAGRAM:
-{instagram_caption}
+                        uploaded = ["campaign text"]
+                        if "poster" in st.session_state:
+                            poster_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+                            poster_temp_path = poster_temp.name
+                            poster_temp.close()
+                            st.session_state.poster.save(poster_temp_path)
+                            upload_binary_file(drive_service, folder_id, f"{folder_name}_poster.png", poster_temp_path, "image/png")
+                            uploaded.append("poster")
 
----
+                        if "video_path" in st.session_state:
+                            upload_binary_file(drive_service, folder_id, f"{folder_name}_video.mp4", st.session_state.video_path, "video/mp4")
+                            uploaded.append("video")
 
-FACEBOOK:
-{facebook_post}
+                        st.success(f"Uploaded: {', '.join(uploaded)}")
+                        st.link_button("Open Drive folder", f"https://drive.google.com/drive/folders/{folder_id}")
+                    except Exception as exc:
+                        st.error(f"Drive upload failed: {exc}")
 
----
-
-WHATSAPP:
-{whatsapp_message}
-"""
-                zf.writestr(f"{st.session_state.product_name}_social_posts.txt", social_posts)
-                
-                # Add poster
-                if "poster" in st.session_state:
-                    poster_bytes = io.BytesIO()
-                    st.session_state.poster.save(poster_bytes, format="PNG")
-                    zf.writestr(f"{st.session_state.product_name}_poster.png", poster_bytes.getvalue())
-                
-                # Add video
-                if "video_path" in st.session_state:
-                    with open(st.session_state.video_path, 'rb') as f:
-                        zf.writestr(f"{st.session_state.product_name}_video.mp4", f.read())
-            
-            zip_buffer.seek(0)
-            
-            st.download_button(
-                label="📥 Download Complete Campaign Package",
-                data=zip_buffer,
-                file_name=f"{st.session_state.product_name}_campaign_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip",
-                type="primary"
-            )
-
-
-# ============================================================================
-# FOOTER
-# ============================================================================
-st.markdown("---")
-st.markdown("""
-<div style="text-align: center; padding: 2rem; background: #f0f2f6; border-radius: 10px;">
-    <p><strong>Samketan AI Marketing Factory</strong></p>
-    <p>Turn any product image into a complete multi-channel marketing campaign in minutes</p>
-    <p style="font-size: 0.9rem; color: #666;">
-        Built for MSMEs in Tier-2 & Tier-3 cities | Powered by Gemini AI
-    </p>
-</div>
-""", unsafe_allow_html=True)
+st.divider()
+st.caption("Built for Samketan. Use stable Gemini models for production; preview and robotics models can be retired without long notice.")
